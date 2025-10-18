@@ -47,13 +47,16 @@ def main():
         from bot import main as bot_main
         import asyncio
         
-        # Просто запускаем main функцию напрямую
+        # Простое решение: всегда создаем новый event loop
+        print("🚀 Запуск бота...")
         asyncio.run(bot_main())
             
     except KeyboardInterrupt:
         print("\n⏹️ Бот остановлен пользователем")
     except Exception as e:
         print(f"❌ Ошибка при запуске бота: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == '__main__':
     main()

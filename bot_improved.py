@@ -437,8 +437,20 @@ async def main():
     
     logger.info("Улучшенный бот запущен!")
     
-    # Запускаем бота
-    await application.run_polling()
+    try:
+        # Запускаем бота
+        await application.run_polling()
+    except KeyboardInterrupt:
+        logger.info("Получен сигнал остановки")
+    except Exception as e:
+        logger.error(f"Ошибка при работе бота: {e}")
+        raise
+    finally:
+        # Останавливаем планировщик при завершении
+        if bot_instance.scheduler.running:
+            logger.info("Остановка планировщика...")
+            bot_instance.scheduler.shutdown()
+        logger.info("Улучшенный бот остановлен")
 
 if __name__ == '__main__':
     import asyncio
