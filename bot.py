@@ -360,6 +360,7 @@ async def main():
     # Запускаем бота
     await application.run_polling()
 
-if __name__ == '__main__':
-    import asyncio
-    asyncio.run(main())
+# Убрано asyncio.run() отсюда, чтобы избежать конфликта с run.py
+# if __name__ == '__main__':
+#     import asyncio
+#     asyncio.run(main())

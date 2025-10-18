@@ -46,7 +46,10 @@ def main():
     try:
         from bot import main as bot_main
         import asyncio
+        
+        # Просто запускаем main функцию напрямую
         asyncio.run(bot_main())
+            
     except KeyboardInterrupt:
         print("\n⏹️ Бот остановлен пользователем")
     except Exception as e:
