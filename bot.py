@@ -20,7 +20,9 @@ logger = logging.getLogger(__name__)
 class TaskAssistantBot:
     def __init__(self):
         self.db = TaskDatabase()
-        self.scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+        # Принудительно используем московский часовой пояс для планировщика
+        moscow_tz = pytz.timezone('Europe/Moscow')
+        self.scheduler = AsyncIOScheduler(timezone=moscow_tz)
         self.setup_scheduler()
     
     def setup_scheduler(self):
@@ -29,21 +31,27 @@ class TaskAssistantBot:
             # Напоминание о задаче
             for day in task_config['days']:
                 hour, minute = map(int, task_config['time'].split(':'))
+                # Добавляем время в ID для уникальности
+                job_id = f'reminder_{task_type}_{day}_{hour:02d}{minute:02d}'
                 self.scheduler.add_job(
                     self.send_task_reminder,
                     CronTrigger(day_of_week=day, hour=hour, minute=minute),
                     args=[task_type, task_config['name']],
-                    id=f'reminder_{task_type}_{day}'
+                    id=job_id,
+                    replace_existing=True  # Заменяем существующую задачу, если ID совпадает
                 )
             
             # Контроль выполнения
             for day in task_config['days']:
                 hour, minute = map(int, task_config['check_time'].split(':'))
+                # Добавляем время в ID для уникальности
+                job_id = f'check_{task_type}_{day}_{hour:02d}{minute:02d}'
                 self.scheduler.add_job(
                     self.send_completion_check,
                     CronTrigger(day_of_week=day, hour=hour, minute=minute),
                     args=[task_type, task_config['name']],
-                    id=f'check_{task_type}_{day}'
+                    id=job_id,
+                    replace_existing=True  # Заменяем существующую задачу, если ID совпадает
                 )
         
         # Ежедневный отчет в 22:00
@@ -138,6 +146,14 @@ class TaskAssistantBot:
         """Отправить проверку выполнения задачи"""
         try:
             today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
+            
+            # Проверяем, есть ли уже задача в базе данных
+            existing_tasks = self.db.get_tasks_for_date(today)
+            task_exists = any(task['task_type'] == task_type for task in existing_tasks)
+            
+            if not task_exists:
+                logger.warning(f"Задача {task_type} не найдена в базе данных для {today}, пропускаем проверку")
+                return
             
             message = f"🔍 Контроль выполнения!\n\n📋 Задача: {task_name}\n⏰ Время проверки: {datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%H:%M')}\n\nВыполнили ли вы эту задачу?"
             
