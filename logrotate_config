@@ -1,0 +1,15 @@
+# Конфигурация logrotate для Capsula Assistant
+# Разместить в /etc/logrotate.d/capsula-assistant
+
+/var/log/capsula-assistant/*.log {
+    daily
+    missingok
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    create 644 root root
+    postrotate
+        systemctl reload capsula-assistant > /dev/null 2>&1 || true
+    endscript
+}
