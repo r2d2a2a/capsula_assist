@@ -460,6 +460,7 @@ async def main():
         import asyncio
         
         shutting_down = False
+        stop_event = asyncio.Event()
         
         def signal_handler():
             logger.info("Получен сигнал остановки")
@@ -489,14 +490,19 @@ async def main():
                 logger.info("Остановка планировщика...")
                 bot_instance.scheduler.shutdown()
             logger.info("Улучшенный бот остановлен")
+            # Сигнализируем главному циклу завершиться
+            try:
+                stop_event.set()
+            except Exception:
+                pass
         
         # Регистрируем обработчик сигналов
         for sig in [signal.SIGTERM, signal.SIGINT]:
             signal.signal(sig, lambda s, f: signal_handler())
         
         # Ждем бесконечно
-        while True:
-            await asyncio.sleep(1)
+        # Ожидаем завершения (сигнал от shutdown)
+        await stop_event.wait()
             
     except Exception as e:
         logger.error(f"Ошибка при работе бота: {e}")
