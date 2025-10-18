@@ -15,25 +15,25 @@ TASKS_SCHEDULE = {
     'meditation': {
         'time': '06:05',
         'check_time': '06:50',
-        'days': ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
+        'days': [0, 1, 2, 3, 4, 5, 6],  # 0=понедельник, 6=воскресенье
         'name': 'Медитация'
     },
     'planning': {
         'time': '09:00',
         'check_time': '09:16',
-        'days': ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
+        'days': [0, 1, 2, 3, 4, 5, 6],  # 0=понедельник, 6=воскресенье
         'name': 'Планирование'
     },
     'workout': {
         'time': '15:00',
         'check_time': '17:00',
-        'days': ['monday', 'thursday', 'sunday'],
+        'days': [0, 3, 6],  # понедельник, четверг, воскресенье
         'name': 'Тренировка'
     },
     'yoga': {
         'time': '15:00',
         'check_time': '17:00',
-        'days': ['tuesday', 'wednesday', 'friday', 'saturday'],
+        'days': [1, 2, 4, 5],  # вторник, среда, пятница, суббота
         'name': 'Йога'
     }
 }

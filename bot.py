@@ -56,7 +56,7 @@ class TaskAssistantBot:
         # Еженедельный отчет в воскресенье в 22:30
         self.scheduler.add_job(
             self.send_weekly_report,
-            CronTrigger(day_of_week='sun', hour=22, minute=30),
+            CronTrigger(day_of_week=6, hour=22, minute=30),  # 6 = воскресенье
             id='weekly_report'
         )
     
