@@ -438,19 +438,53 @@ async def main():
     logger.info("Улучшенный бот запущен!")
     
     try:
-        # Запускаем бота
-        await application.run_polling()
-    except KeyboardInterrupt:
-        logger.info("Получен сигнал остановки")
+        # Инициализируем приложение
+        await application.initialize()
+        
+        # Запускаем polling
+        await application.start()
+        await application.updater.start_polling()
+        
+        logger.info("Улучшенный бот успешно запущен и работает!")
+        
+        # Ждем бесконечно, пока не получим сигнал остановки
+        import signal
+        import asyncio
+        
+        def signal_handler():
+            logger.info("Получен сигнал остановки")
+            asyncio.create_task(shutdown())
+        
+        async def shutdown():
+            logger.info("Начинаем остановку улучшенного бота...")
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
+            
+            # Останавливаем планировщик
+            if bot_instance.scheduler.running:
+                logger.info("Остановка планировщика...")
+                bot_instance.scheduler.shutdown()
+            logger.info("Улучшенный бот остановлен")
+        
+        # Регистрируем обработчик сигналов
+        for sig in [signal.SIGTERM, signal.SIGINT]:
+            signal.signal(sig, lambda s, f: signal_handler())
+        
+        # Ждем бесконечно
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            await shutdown()
+            
     except Exception as e:
         logger.error(f"Ошибка при работе бота: {e}")
-        raise
-    finally:
-        # Останавливаем планировщик при завершении
+        # Останавливаем планировщик при ошибке
         if bot_instance.scheduler.running:
             logger.info("Остановка планировщика...")
             bot_instance.scheduler.shutdown()
-        logger.info("Улучшенный бот остановлен")
+        raise
 
 if __name__ == '__main__':
     import asyncio
