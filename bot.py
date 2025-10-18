@@ -256,17 +256,32 @@ class TaskAssistantBot:
         if update.effective_user.id != USER_ID:
             return
         
-        today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
-        tasks = self.db.get_tasks_for_date(today)
+        tz = pytz.timezone(TIMEZONE)
+        now = datetime.datetime.now(tz)
+        today_str = now.strftime('%Y-%m-%d')
+        weekday = now.weekday()  # 0=понедельник
         
-        if not tasks:
-            await update.message.reply_text("На сегодня задач пока нет.")
+        # Статусы из БД по типу задачи
+        tasks_in_db = {t['task_type']: t for t in self.db.get_tasks_for_date(today_str)}
+        
+        # Формируем список задач по расписанию на сегодня
+        scheduled_today = []
+        for task_type, cfg in TASKS_SCHEDULE.items():
+            if weekday in cfg['days']:
+                scheduled_today.append((task_type, cfg['name']))
+        
+        # Если по расписанию ничего нет (теоретически), сообщим, но с нашим ТЗ это не случится
+        if not scheduled_today:
+            await update.message.reply_text(f"📅 На сегодня ({today_str}) задач нет по расписанию.")
             return
         
-        message = f"📋 Задачи на сегодня ({today}):\n\n"
-        for task in tasks:
-            status = "✅" if task['completed'] else "❌"
-            message += f"• {task['task_type']}: {status}\n"
+        message = f"📋 Задачи на сегодня ({today_str}):\n\n"
+        for task_type, display_name in scheduled_today:
+            if task_type in tasks_in_db:
+                status = "✅" if tasks_in_db[task_type]['completed'] else "⏳"
+            else:
+                status = "⏳"  # еще нет записи в БД, но задача по расписанию есть
+            message += f"• {display_name}: {status}\n"
         
         await update.message.reply_text(message)
     
@@ -371,13 +386,28 @@ async def main():
         import signal
         import asyncio
         
+        shutting_down = False
+        
         def signal_handler():
             logger.info("Получен сигнал остановки")
             asyncio.create_task(shutdown())
         
         async def shutdown():
+            nonlocal shutting_down
+            if shutting_down:
+                return
+            shutting_down = True
             logger.info("Начинаем остановку бота...")
-            await application.updater.stop()
+            # Останавливаем polling только если он запущен
+            try:
+                if getattr(application, 'updater', None):
+                    await application.updater.stop()
+            except RuntimeError:
+                # Updater уже остановлен
+                pass
+            except Exception as e:
+                logger.error(f"Ошибка при остановке updater: {e}")
+            
             await application.stop()
             await application.shutdown()
             
@@ -392,11 +422,8 @@ async def main():
             signal.signal(sig, lambda s, f: signal_handler())
         
         # Ждем бесконечно
-        try:
-            while True:
-                await asyncio.sleep(1)
-        except KeyboardInterrupt:
-            await shutdown()
+        while True:
+            await asyncio.sleep(1)
             
     except Exception as e:
         logger.error(f"Ошибка при работе бота: {e}")
