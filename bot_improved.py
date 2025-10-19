@@ -57,17 +57,17 @@ class ImprovedTaskAssistantBot:
                     replace_existing=True  # Заменяем существующую задачу, если ID совпадает
                 )
         
-        # Ежедневный отчет в 22:00
+        # Ежедневный отчет в 20:00
         self.scheduler.add_job(
             self.send_daily_report,
-            CronTrigger(hour=22, minute=0, timezone=self.moscow_tz),
+            CronTrigger(hour=20, minute=0, timezone=self.moscow_tz),
             id='daily_report'
         )
         
-        # Еженедельный отчет в воскресенье в 22:30
+        # Еженедельный отчет в воскресенье в 20:30
         self.scheduler.add_job(
             self.send_weekly_report,
-            CronTrigger(day_of_week='sun', hour=22, minute=30, timezone=self.moscow_tz),
+            CronTrigger(day_of_week='sun', hour=20, minute=30, timezone=self.moscow_tz),
             id='weekly_report'
         )
         # Диагностика таймзоны
