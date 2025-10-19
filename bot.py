@@ -3,7 +3,7 @@ import datetime
 from typing import Dict, List
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -70,7 +70,11 @@ class TaskAssistantBot:
         # Диагностика таймзоны
         logger.info(f"APScheduler timezone: {self.scheduler.timezone}")
         for job in self.scheduler.get_jobs():
-            logger.info(f"Job {job.id} next run: {job.next_run_time}")
+            try:
+                next_run = getattr(job, 'next_run_time', None)
+            except Exception:
+                next_run = None
+            logger.info(f"Job {job.id} next run: {next_run}")
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start"""
@@ -189,6 +193,8 @@ class TaskAssistantBot:
             for task in tasks:
                 status = "✅" if task['completed'] else "❌"
                 report += f"• {task['task_type']}: {status}\n"
+                if task.get('comment'):
+                    report += f"   📝 {task['comment']}\n"
             
             # Сохраняем отчет
             self.db.save_report('daily', today, today, stats)
@@ -230,6 +236,13 @@ class TaskAssistantBot:
                 day_stats = daily_stats[date]
                 rate = (day_stats['completed'] / day_stats['total'] * 100) if day_stats['total'] > 0 else 0
                 report += f"• {date}: {day_stats['completed']}/{day_stats['total']} ({rate:.1f}%)\n"
+
+            # Комментарии за неделю
+            comments = [t for t in tasks if t.get('comment')]
+            if comments:
+                report += "\n📝 Комментарии:\n"
+                for t in comments:
+                    report += f"• {t['date']} {t['task_type']}: {t['comment']}\n"
             
             # Сохраняем отчет
             self.db.save_report('weekly', week_start, week_end, stats)
@@ -270,6 +283,44 @@ class TaskAssistantBot:
                 f"{status_emoji} Задача {task_type} отмечена как {status_text}",
                 reply_markup=None
             )
+            # Если выполнено — предложим оставить комментарий
+            if completed:
+                context.user_data['awaiting_comment'] = {"task_type": task_type, "date": date}
+                skip_keyboard = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⏭️ Пропустить", callback_data=f"skip_comment_{task_type}_{date}")]]
+                )
+                await self.send_message_to_user(
+                    "📝 Хотите оставить короткий комментарий о практике? Просто отправьте сообщение в ответ.",
+                    reply_markup=skip_keyboard
+                )
+            return
+
+        if data.startswith('skip_comment_'):
+            parts = data.split('_')
+            task_type = parts[2]
+            date = parts[3]
+            awaiting = context.user_data.get('awaiting_comment')
+            if awaiting and awaiting.get('task_type') == task_type and awaiting.get('date') == date:
+                context.user_data.pop('awaiting_comment', None)
+            await query.edit_message_text("✅ Комментарий пропущен.")
+            return
+
+    async def comment_message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка текстового комментария после выполнения задачи"""
+        if update.effective_user.id != USER_ID:
+            return
+        awaiting = context.user_data.get('awaiting_comment')
+        if not awaiting:
+            return
+        task_type = awaiting['task_type']
+        date = awaiting['date']
+        comment_text = (update.message.text or '').strip()
+        if not comment_text:
+            await update.message.reply_text("Комментарий пуст. Отправьте текст или нажмите Пропустить.")
+            return
+        self.db.set_task_comment(task_type, date, comment_text)
+        context.user_data.pop('awaiting_comment', None)
+        await update.message.reply_text("💾 Комментарий сохранен. Спасибо!")
     
     async def today_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /today"""
@@ -386,6 +437,8 @@ async def main():
     
     # Добавляем обработчик кнопок
     application.add_handler(CallbackQueryHandler(bot_instance.button_callback))
+    # Обработчик текстовых сообщений как комментариев
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot_instance.comment_message_handler))
     
     # Запускаем планировщик
     bot_instance.scheduler.start()

@@ -22,6 +22,7 @@ class TaskDatabase:
                 reminder_sent BOOLEAN DEFAULT FALSE,
                 completed BOOLEAN DEFAULT FALSE,
                 completion_time TEXT,
+                comment TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -30,6 +31,12 @@ class TaskDatabase:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique
             ON tasks(task_type, date)
         ''')
+        # На случай существующей таблицы без столбца comment
+        try:
+            cursor.execute('ALTER TABLE tasks ADD COLUMN comment TEXT')
+        except sqlite3.OperationalError:
+            # Столбец уже существует
+            pass
         
         # Таблица для хранения отчетов
         cursor.execute('''
@@ -104,6 +111,16 @@ class TaskDatabase:
             return False, -1
         finally:
             conn.close()
+
+    def set_task_comment(self, task_type: str, date: str, comment: str):
+        """Сохранить комментарий к задаче"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE tasks SET comment = ? WHERE task_type = ? AND date = ?
+        ''', (comment, task_type, date))
+        conn.commit()
+        conn.close()
     
     def mark_reminder_sent(self, task_id: int):
         """Отметить, что напоминание отправлено"""
