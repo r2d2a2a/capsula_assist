@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 class TaskAssistantBot:
     def __init__(self):
         self.db = TaskDatabase()
-        # Принудительно используем московский часовой пояс для планировщика
-        moscow_tz = pytz.timezone('Europe/Moscow')
-        self.scheduler = AsyncIOScheduler(timezone=moscow_tz)
+        # Принудительно используем московский часовой пояс
+        self.moscow_tz = pytz.timezone('Europe/Moscow')
+        self.scheduler = AsyncIOScheduler(timezone=self.moscow_tz)
         self.setup_scheduler()
     
     def setup_scheduler(self):
@@ -35,7 +35,7 @@ class TaskAssistantBot:
                 job_id = f'reminder_{task_type}_{day}_{hour:02d}{minute:02d}'
                 self.scheduler.add_job(
                     self.send_task_reminder,
-                    CronTrigger(day_of_week=day, hour=hour, minute=minute),
+                    CronTrigger(day_of_week=day, hour=hour, minute=minute, timezone=self.moscow_tz),
                     args=[task_type, task_config['name']],
                     id=job_id,
                     replace_existing=True  # Заменяем существующую задачу, если ID совпадает
@@ -48,7 +48,7 @@ class TaskAssistantBot:
                 job_id = f'check_{task_type}_{day}_{hour:02d}{minute:02d}'
                 self.scheduler.add_job(
                     self.send_completion_check,
-                    CronTrigger(day_of_week=day, hour=hour, minute=minute),
+                    CronTrigger(day_of_week=day, hour=hour, minute=minute, timezone=self.moscow_tz),
                     args=[task_type, task_config['name']],
                     id=job_id,
                     replace_existing=True  # Заменяем существующую задачу, если ID совпадает
@@ -57,16 +57,20 @@ class TaskAssistantBot:
         # Ежедневный отчет в 22:00
         self.scheduler.add_job(
             self.send_daily_report,
-            CronTrigger(hour=22, minute=0),
+            CronTrigger(hour=22, minute=0, timezone=self.moscow_tz),
             id='daily_report'
         )
         
         # Еженедельный отчет в воскресенье в 22:30
         self.scheduler.add_job(
             self.send_weekly_report,
-            CronTrigger(day_of_week=6, hour=22, minute=30),  # 6 = воскресенье
+            CronTrigger(day_of_week=6, hour=22, minute=30, timezone=self.moscow_tz),  # 6 = воскресенье
             id='weekly_report'
         )
+        # Диагностика таймзоны
+        logger.info(f"APScheduler timezone: {self.scheduler.timezone}")
+        for job in self.scheduler.get_jobs():
+            logger.info(f"Job {job.id} next run: {job.next_run_time}")
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start"""
@@ -118,10 +122,11 @@ class TaskAssistantBot:
         """Отправить напоминание о задаче"""
         try:
             today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
-            
-            # Добавляем задачу в базу данных
-            task_id = self.db.add_task(task_type, today)
-            
+            # Атомарно получаем право на отправку, чтобы избежать дублей
+            lock_acquired, _ = self.db.acquire_send_lock(task_type, today)
+            if not lock_acquired:
+                logger.info(f"Пропускаем дубликат напоминания для {task_type} на {today}")
+                return
             # Отправляем напоминание
             message = f"⏰ Напоминание!\n\n📋 Время для: {task_name}\n🕐 {datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%H:%M')}"
             
@@ -136,8 +141,7 @@ class TaskAssistantBot:
             # Это будет реализовано в main функции
             await self.send_message_to_user(message, reply_markup)
             
-            # Отмечаем, что напоминание отправлено
-            self.db.mark_reminder_sent(task_id)
+            # Флаг already set в acquire_send_lock
             
         except Exception as e:
             logger.error(f"Ошибка при отправке напоминания: {e}")

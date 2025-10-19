@@ -25,6 +25,11 @@ class TaskDatabase:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Гарантируем уникальность задачи на дату по типу
+        cursor.execute('''
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique
+            ON tasks(task_type, date)
+        ''')
         
         # Таблица для хранения отчетов
         cursor.execute('''
@@ -58,6 +63,47 @@ class TaskDatabase:
         conn.close()
         
         return task_id
+
+    def acquire_send_lock(self, task_type: str, date: str) -> (bool, int):
+        """Атомарно создать задачу (если нет) и установить флаг отправки напоминания.
+
+        Возвращает кортеж (lock_acquired, task_id).
+        Если lock_acquired = True — текущий процесс должен отправить напоминание.
+        Если False — напоминание уже отправлялось другим процессом.
+        """
+        conn = sqlite3.connect(self.db_path)
+        # Важно: включаем немедленную блокировку для предотвращения гонок между процессами
+        conn.isolation_level = None
+        cursor = conn.cursor()
+        try:
+            cursor.execute('BEGIN IMMEDIATE')
+            cursor.execute('SELECT id, reminder_sent FROM tasks WHERE task_type = ? AND date = ?', (task_type, date))
+            row = cursor.fetchone()
+            if row:
+                task_id, reminder_sent = row
+                if reminder_sent:
+                    cursor.execute('COMMIT')
+                    return False, task_id
+                # Помечаем как отправленное и разрешаем отправку из текущего процесса
+                cursor.execute('UPDATE tasks SET reminder_sent = TRUE WHERE id = ?', (task_id,))
+                cursor.execute('COMMIT')
+                return True, task_id
+            # Задачи еще нет — создаем сразу с reminder_sent = TRUE
+            cursor.execute('''
+                INSERT INTO tasks (task_type, date, reminder_sent)
+                VALUES (?, ?, TRUE)
+            ''', (task_type, date))
+            task_id = cursor.lastrowid
+            cursor.execute('COMMIT')
+            return True, task_id
+        except Exception:
+            try:
+                cursor.execute('ROLLBACK')
+            except Exception:
+                pass
+            return False, -1
+        finally:
+            conn.close()
     
     def mark_reminder_sent(self, task_id: int):
         """Отметить, что напоминание отправлено"""

@@ -10,6 +10,7 @@ User=root
 Group=root
 WorkingDirectory=/Capsula_assist/capsula_assist
 Environment=PATH=/Capsula_assist/capsula_assist/venv/bin
+Environment=TZ=Europe/Moscow
 ExecStart=/Capsula_assist/capsula_assist/venv/bin/python /Capsula_assist/capsula_assist/run.py
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
