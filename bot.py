@@ -815,7 +815,7 @@ class TaskAssistantBot:
         chat_id = update.effective_chat.id
         user = self.db.get_user_by_chat_id(chat_id)
         if not user:
-            await update.message.reply_text("Начните с /start")
+            await self.send_message_to_chat(chat_id, "Начните с /start")
             return
         user_id = user['id']
         defs = self.db.list_task_definitions(user_id)
@@ -826,7 +826,7 @@ class TaskAssistantBot:
             if weekday in days_list:
                 scheduled_today.append((d['id'], d['name']))
         if not scheduled_today:
-            await update.message.reply_text(f"📅 На сегодня ({today_str}) задач нет по расписанию.")
+            await self.send_message_to_chat(chat_id, f"📅 На сегодня ({today_str}) задач нет по расписанию.")
             return
         message = f"📋 Задачи на сегодня ({today_str}):\n\n"
         keyboard = []
@@ -840,7 +840,7 @@ class TaskAssistantBot:
                 InlineKeyboardButton(f"✅ {display_name}", callback_data=f"v2_quick_yes_{def_id}_{today_str}"),
                 InlineKeyboardButton("❌", callback_data=f"v2_quick_no_{def_id}_{today_str}")
             ])
-        await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
+        await self.send_message_to_chat(chat_id, message, InlineKeyboardMarkup(keyboard))
     
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /stats"""
@@ -874,30 +874,30 @@ class TaskAssistantBot:
         else:
             user_id = user['id']
         if self.db.count_task_definitions(user_id) >= 10:
-            await update.message.reply_text("Вы достигли лимита 10 задач.")
+            await self.send_message_to_chat(chat_id, "Вы достигли лимита 10 задач.")
             return
         self.add_task_state[chat_id] = {'user_id': user_id, 'step': 'name'}
-        await update.message.reply_text("Введите короткое название задачи (например, 'Медитация'):")
+        await self.send_message_to_chat(chat_id, "Введите короткое название задачи (например, 'Медитация'):")
 
     async def edittask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         user = self.db.get_user_by_chat_id(chat_id)
         if not user:
-            await update.message.reply_text("Начните с /start")
+            await self.send_message_to_chat(chat_id, "Начните с /start")
             return
         user_id = user['id']
         args = context.args if hasattr(context, 'args') else []
         if not args:
-            await update.message.reply_text("Использование: /edittask <id>")
+            await self.send_message_to_chat(chat_id, "Использование: /edittask <id>")
             return
         try:
             def_id = int(args[0])
         except ValueError:
-            await update.message.reply_text("Неверный id. Пример: /edittask 3")
+            await self.send_message_to_chat(chat_id, "Неверный id. Пример: /edittask 3")
             return
         d = self.db.get_task_definition(user_id, def_id)
         if not d:
-            await update.message.reply_text("Задача не найдена или уже удалена.")
+            await self.send_message_to_chat(chat_id, "Задача не найдена или уже удалена.")
             return
         self.edit_task_state[chat_id] = {
             'user_id': user_id,
@@ -918,41 +918,41 @@ class TaskAssistantBot:
             [InlineKeyboardButton("Время контроля", callback_data="edittask_field_check")],
             [InlineKeyboardButton("Сохранить", callback_data="edittask_save"), InlineKeyboardButton("Отмена", callback_data="edittask_cancel")]
         ]
-        await update.message.reply_text("Что изменить?", reply_markup=InlineKeyboardMarkup(kb))
+        await self.send_message_to_chat(chat_id, "Что изменить?", InlineKeyboardMarkup(kb))
 
     async def deletetask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         user = self.db.get_user_by_chat_id(chat_id)
         if not user:
-            await update.message.reply_text("Начните с /start")
+            await self.send_message_to_chat(chat_id, "Начните с /start")
             return
         user_id = user['id']
         args = context.args if hasattr(context, 'args') else []
         if not args:
-            await update.message.reply_text("Использование: /deletetask <id>")
+            await self.send_message_to_chat(chat_id, "Использование: /deletetask <id>")
             return
         try:
             def_id = int(args[0])
         except ValueError:
-            await update.message.reply_text("Неверный id. Пример: /deletetask 3")
+            await self.send_message_to_chat(chat_id, "Неверный id. Пример: /deletetask 3")
             return
         ok = self.db.deactivate_task_definition(user_id, def_id)
         if not ok:
-            await update.message.reply_text("Задача не найдена или уже удалена.")
+            await self.send_message_to_chat(chat_id, "Задача не найдена или уже удалена.")
             return
         self.unschedule_task_definition(chat_id, def_id)
-        await update.message.reply_text("🗑️ Задача удалена и расписание очищено.")
+        await self.send_message_to_chat(chat_id, "🗑️ Задача удалена и расписание очищено.")
 
     async def mytasks_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         user = self.db.get_user_by_chat_id(chat_id)
         if not user:
-            await update.message.reply_text("Начните с /start")
+            await self.send_message_to_chat(chat_id, "Начните с /start")
             return
         defs = self.db.list_task_definitions(user['id'])
         if not defs:
             kb = [[InlineKeyboardButton("➕ Добавить задачу", callback_data="start_addtask")]]
-            await update.message.reply_text("У вас пока нет задач. Нажмите, чтобы добавить:", reply_markup=InlineKeyboardMarkup(kb))
+            await self.send_message_to_chat(chat_id, "У вас пока нет задач. Нажмите, чтобы добавить:", InlineKeyboardMarkup(kb))
             return
         lines = ["Ваши задачи (нажмите, чтобы управлять):"]
         days_names = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс']
@@ -965,7 +965,7 @@ class TaskAssistantBot:
         for d in defs:
             kb_rows.append([InlineKeyboardButton(f"✏️ {d['name']} (#{d['id']})", callback_data=f"manage_def_{d['id']}")])
         kb_rows.append([InlineKeyboardButton("➕ Добавить задачу", callback_data="start_addtask")])
-        await update.message.reply_text('\n'.join(lines), reply_markup=InlineKeyboardMarkup(kb_rows))
+        await self.send_message_to_chat(chat_id, '\n'.join(lines), InlineKeyboardMarkup(kb_rows))
 
     async def show_days_keyboard(self, chat_id: int):
         st = self.add_task_state.get(chat_id) or {}
