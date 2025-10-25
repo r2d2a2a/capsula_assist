@@ -155,12 +155,10 @@ class TaskAssistantBot:
         try:
             today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
             
-            # Проверяем, есть ли уже задача в базе данных
-            existing_tasks = self.db.get_tasks_for_date(today)
-            task_exists = any(task['task_type'] == task_type for task in existing_tasks)
-            
-            if not task_exists:
-                logger.warning(f"Задача {task_type} не найдена в базе данных для {today}, пропускаем проверку")
+            # Атомарно получаем право на отправку проверки, чтобы избежать дублей
+            lock_acquired, _ = self.db.acquire_check_lock(task_type, today)
+            if not lock_acquired:
+                logger.info(f"Пропускаем дубликат проверки для {task_type} на {today}")
                 return
             
             message = f"🔍 Контроль выполнения!\n\n📋 Задача: {task_name}\n⏰ Время проверки: {datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%H:%M')}\n\nВыполнили ли вы эту задачу?"

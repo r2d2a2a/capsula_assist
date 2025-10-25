@@ -20,6 +20,7 @@ class TaskDatabase:
                 task_type TEXT NOT NULL,
                 date TEXT NOT NULL,
                 reminder_sent BOOLEAN DEFAULT FALSE,
+                check_sent BOOLEAN DEFAULT FALSE,
                 completed BOOLEAN DEFAULT FALSE,
                 completion_time TEXT,
                 comment TEXT,
@@ -34,6 +35,13 @@ class TaskDatabase:
         # На случай существующей таблицы без столбца comment
         try:
             cursor.execute('ALTER TABLE tasks ADD COLUMN comment TEXT')
+        except sqlite3.OperationalError:
+            # Столбец уже существует
+            pass
+        
+        # На случай существующей таблицы без столбца check_sent
+        try:
+            cursor.execute('ALTER TABLE tasks ADD COLUMN check_sent BOOLEAN DEFAULT FALSE')
         except sqlite3.OperationalError:
             # Столбец уже существует
             pass
@@ -98,6 +106,47 @@ class TaskDatabase:
             # Задачи еще нет — создаем сразу с reminder_sent = TRUE
             cursor.execute('''
                 INSERT INTO tasks (task_type, date, reminder_sent)
+                VALUES (?, ?, TRUE)
+            ''', (task_type, date))
+            task_id = cursor.lastrowid
+            cursor.execute('COMMIT')
+            return True, task_id
+        except Exception:
+            try:
+                cursor.execute('ROLLBACK')
+            except Exception:
+                pass
+            return False, -1
+        finally:
+            conn.close()
+
+    def acquire_check_lock(self, task_type: str, date: str) -> (bool, int):
+        """Атомарно получить право на отправку проверки выполнения.
+
+        Возвращает кортеж (lock_acquired, task_id).
+        Если lock_acquired = True — текущий процесс должен отправить проверку.
+        Если False — проверка уже отправлялась другим процессом.
+        """
+        conn = sqlite3.connect(self.db_path)
+        # Важно: включаем немедленную блокировку для предотвращения гонок между процессами
+        conn.isolation_level = None
+        cursor = conn.cursor()
+        try:
+            cursor.execute('BEGIN IMMEDIATE')
+            cursor.execute('SELECT id, check_sent FROM tasks WHERE task_type = ? AND date = ?', (task_type, date))
+            row = cursor.fetchone()
+            if row:
+                task_id, check_sent = row
+                if check_sent:
+                    cursor.execute('COMMIT')
+                    return False, task_id
+                # Помечаем как отправленное и разрешаем отправку из текущего процесса
+                cursor.execute('UPDATE tasks SET check_sent = TRUE WHERE id = ?', (task_id,))
+                cursor.execute('COMMIT')
+                return True, task_id
+            # Задачи еще нет — создаем сразу с check_sent = TRUE
+            cursor.execute('''
+                INSERT INTO tasks (task_type, date, check_sent)
                 VALUES (?, ?, TRUE)
             ''', (task_type, date))
             task_id = cursor.lastrowid
