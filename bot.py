@@ -1032,11 +1032,7 @@ async def main():
             BotCommand("mytasks", "Мои задачи"),
             BotCommand("edittask", "Редактировать задачу"),
             BotCommand("deletetask", "Удалить задачу"),
-            BotCommand("today", "Задачи на сегодня"),
-            BotCommand("stats", "Статистика за сегодня"),
             BotCommand("report", "Отчет за сегодня"),
-            BotCommand("start_bot", "Запустить напоминания"),
-            BotCommand("stop_bot", "Остановить напоминания"),
         ])
     except Exception as e:
         logger.error(f"Не удалось установить команды бота: {e}")
