@@ -286,6 +286,63 @@ class TaskDatabase:
         conn.close()
         return defs
 
+    def get_task_definition(self, user_id: int, def_id: int) -> Optional[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM task_definitions WHERE id = ? AND user_id = ? AND active = 1', (def_id, user_id))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return None
+        columns = [d[0] for d in cursor.description]
+        result = dict(zip(columns, row))
+        days_str = result.get('days') or ''
+        result['days_list'] = [int(x) for x in days_str.split(',') if x.strip().isdigit()]
+        conn.close()
+        return result
+
+    def update_task_definition(self, user_id: int, def_id: int, name: Optional[str] = None, frequency: Optional[str] = None,
+                                days: Optional[List[int]] = None, reminder_time: Optional[str] = None, check_time: Optional[str] = None) -> bool:
+        """Обновить поля определения задачи. Возвращает True, если обновлено >=1 строк."""
+        set_parts = []
+        params: List = []
+        if name is not None:
+            set_parts.append('name = ?')
+            params.append(name)
+        if frequency is not None:
+            set_parts.append('frequency = ?')
+            params.append(frequency)
+        if days is not None:
+            days_str = ','.join(str(d) for d in sorted(set(days))) if days else ''
+            set_parts.append('days = ?')
+            params.append(days_str)
+        if reminder_time is not None:
+            set_parts.append('reminder_time = ?')
+            params.append(reminder_time)
+        if check_time is not None:
+            set_parts.append('check_time = ?')
+            params.append(check_time)
+        if not set_parts:
+            return False
+        params.extend([def_id, user_id])
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(f'UPDATE task_definitions SET {", ".join(set_parts)} WHERE id = ? AND user_id = ? AND active = 1', params)
+        updated = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return updated > 0
+
+    def deactivate_task_definition(self, user_id: int, def_id: int) -> bool:
+        """Пометить определение задачи как неактивное."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('UPDATE task_definitions SET active = 0 WHERE id = ? AND user_id = ? AND active = 1', (def_id, user_id))
+        updated = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return updated > 0
+
     def acquire_send_lock_v2(self, user_id: int, task_def_id: int, date: str) -> (bool, int):
         """Новая версия блокировки для напоминаний (по пользователю и определению)."""
         conn = sqlite3.connect(self.db_path)

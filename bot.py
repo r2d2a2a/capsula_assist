@@ -25,6 +25,7 @@ class TaskAssistantBot:
         self.moscow_tz = pytz.timezone('Europe/Moscow')
         self.scheduler = AsyncIOScheduler(timezone=self.moscow_tz)
         self.add_task_state: Dict[int, Dict] = {}
+        self.edit_task_state: Dict[int, Dict] = {}
         self.setup_scheduler()
     
     def setup_scheduler(self):
@@ -79,6 +80,19 @@ class TaskAssistantBot:
                 replace_existing=True
             )
 
+    def unschedule_task_definition(self, chat_id: int, def_id: int):
+        """Удалить все задания напоминаний/проверок для указанного определения задачи."""
+        try:
+            for job in list(self.scheduler.get_jobs()):
+                jid = getattr(job, 'id', '')
+                if isinstance(jid, str) and (jid.startswith(f'v2_reminder_{chat_id}_{def_id}_') or jid.startswith(f'v2_check_{chat_id}_{def_id}_')):
+                    try:
+                        self.scheduler.remove_job(jid)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def schedule_all_for_user(self, chat_id: int, user_id: int):
         defs = self.db.list_task_definitions(user_id)
         for d in defs:
@@ -119,6 +133,8 @@ class TaskAssistantBot:
 /today - Показать задачи на сегодня
 /stats - Показать статистику за сегодня
 /report - Получить отчет за сегодня
+ /edittask <id> - Редактировать задачу
+ /deletetask <id> - Удалить задачу
  
 🔧 Управление:
 /start_bot - Запустить напоминания
@@ -371,6 +387,22 @@ class TaskAssistantBot:
             InlineKeyboardButton("Отмена", callback_data="addtask_cancel")
         ])
         return InlineKeyboardMarkup(rows)
+
+    def build_days_keyboard_edit(self, selected_days: List[int]) -> InlineKeyboardMarkup:
+        days_names = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс']
+        chosen = set(selected_days or [])
+        rows = []
+        for i in range(0, 7, 2):
+            row = []
+            for d in [i, i+1] if i+1 < 7 else [i]:
+                label = ("✅ " if d in chosen else "") + days_names[d]
+                row.append(InlineKeyboardButton(label, callback_data=f"edittask_day_{d}"))
+            rows.append(row)
+        rows.append([
+            InlineKeyboardButton("Готово", callback_data="edittask_days_done"),
+            InlineKeyboardButton("Отмена", callback_data="edittask_cancel")
+        ])
+        return InlineKeyboardMarkup(rows)
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка нажатий на кнопки"""
@@ -449,6 +481,72 @@ class TaskAssistantBot:
                 )
             return
 
+        # ----- Панель управления задачей -----
+        if data.startswith('manage_def_'):
+            chat_id = update.effective_chat.id
+            def_id = int(data.split('_')[-1])
+            user = self.db.get_user_by_chat_id(chat_id)
+            if not user:
+                return
+            user_id = user['id']
+            d = self.db.get_task_definition(user_id, def_id)
+            if not d:
+                await query.edit_message_text("Задача не найдена.")
+                return
+            kb = [
+                [InlineKeyboardButton("✏️ Редактировать", callback_data=f"panel_edit_{def_id}")],
+                [InlineKeyboardButton("🗑️ Удалить", callback_data=f"panel_delete_confirm_{def_id}")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="panel_back_mytasks")]
+            ]
+            await query.edit_message_text(f"Управление задачей #{def_id} — {d.get('name')}", reply_markup=InlineKeyboardMarkup(kb))
+            return
+
+        if data == 'panel_back_mytasks':
+            # Вызовем заново список задач
+            fake_update = Update.de_json(update.to_dict(), update._bot)
+            # Проще: просто отправим команду mytasks
+            await self.mytasks_command(update, context)
+            return
+
+        if data.startswith('panel_edit_'):
+            chat_id = update.effective_chat.id
+            def_id = int(data.split('_')[-1])
+            # Инициируем редактирование как через /edittask
+            class _Ctx:
+                args = [str(def_id)]
+            await self.edittask_command(update, _Ctx())
+            return
+
+        if data.startswith('panel_delete_confirm_'):
+            def_id = int(data.split('_')[-1])
+            kb = [
+                [InlineKeyboardButton("✅ Да, удалить", callback_data=f"panel_delete_{def_id}")],
+                [InlineKeyboardButton("❌ Отмена", callback_data=f"manage_def_{def_id}")]
+            ]
+            await query.edit_message_text("Удалить задачу? Это действие отменит расписание.", reply_markup=InlineKeyboardMarkup(kb))
+            return
+
+        if data.startswith('panel_delete_'):
+            chat_id = update.effective_chat.id
+            def_id = int(data.split('_')[-1])
+            user = self.db.get_user_by_chat_id(chat_id)
+            if not user:
+                return
+            ok = self.db.deactivate_task_definition(user['id'], def_id)
+            if ok:
+                self.unschedule_task_definition(chat_id, def_id)
+                await query.edit_message_text("🗑️ Задача удалена и расписание очищено.")
+            else:
+                await query.edit_message_text("Задача не найдена или уже удалена.")
+            return
+
+        if data == 'start_addtask':
+            # Запуск мастера добавления
+            class _Ctx:
+                args = []
+            await self.addtask_command(update, _Ctx())
+            return
+
         if data.startswith('v2_skip_comment_'):
             parts = data.split('_')
             def_id = int(parts[3])
@@ -504,11 +602,134 @@ class TaskAssistantBot:
             await query.edit_message_text("❌ Добавление задачи отменено")
             return
 
+        # ----- Редактирование задачи -----
+        if data.startswith('edittask_field_'):
+            chat_id = update.effective_chat.id
+            st = self.edit_task_state.get(chat_id)
+            if not st:
+                await query.answer("Нет активного редактирования", show_alert=True)
+                return
+            field = data.split('_')[-1]
+            if field == 'name':
+                st['awaiting'] = 'name'
+                await query.edit_message_text("Введите новое название задачи:")
+            elif field == 'freq':
+                keyboard = [[
+                    InlineKeyboardButton("Ежедневно", callback_data="edittask_freq_daily"),
+                    InlineKeyboardButton("По дням недели", callback_data="edittask_freq_weekly")
+                ], [InlineKeyboardButton("Отмена", callback_data="edittask_cancel")]]
+                await query.edit_message_text("Выберите периодичность:", reply_markup=InlineKeyboardMarkup(keyboard))
+            elif field == 'days':
+                days = st.get('data', {}).get('days') or []
+                await query.edit_message_text("Выберите дни недели. Нажимайте, затем 'Готово'.", reply_markup=self.build_days_keyboard_edit(days))
+            elif field == 'reminder':
+                st['awaiting'] = 'reminder_time'
+                await query.edit_message_text("Введите новое время напоминания HH:MM:")
+            elif field == 'check':
+                st['awaiting'] = 'check_time'
+                await query.edit_message_text("Введите новое время контроля HH:MM:")
+            return
+
+        if data.startswith('edittask_freq_'):
+            chat_id = update.effective_chat.id
+            st = self.edit_task_state.get(chat_id) or {}
+            freq = data.split('_')[2]
+            st.setdefault('data', {})
+            st['data']['frequency'] = 'daily' if freq == 'daily' else 'weekly'
+            if st['data']['frequency'] == 'daily':
+                st['data']['days'] = list(range(7))
+            self.edit_task_state[chat_id] = st
+            await query.edit_message_text("Периодичность обновлена. Нажмите Сохранить или продолжите менять поля.")
+            return
+
+        if data.startswith('edittask_day_'):
+            chat_id = update.effective_chat.id
+            day = int(data.split('_')[2])
+            st = self.edit_task_state.get(chat_id) or {}
+            st.setdefault('data', {})
+            chosen = set(st['data'].get('days') or [])
+            if day in chosen:
+                chosen.remove(day)
+            else:
+                chosen.add(day)
+            st['data']['days'] = sorted(chosen)
+            self.edit_task_state[chat_id] = st
+            await query.edit_message_reply_markup(reply_markup=self.build_days_keyboard_edit(st['data']['days']))
+            return
+
+        if data == 'edittask_days_done':
+            await query.edit_message_text("Дни обновлены. Нажмите Сохранить или продолжите менять поля.")
+            return
+
+        if data == 'edittask_cancel':
+            chat_id = update.effective_chat.id
+            self.edit_task_state.pop(chat_id, None)
+            await query.edit_message_text("❌ Редактирование отменено")
+            return
+
+        if data == 'edittask_save':
+            chat_id = update.effective_chat.id
+            st = self.edit_task_state.get(chat_id)
+            if not st:
+                await query.answer("Нет активного редактирования", show_alert=True)
+                return
+            user_id = st['user_id']
+            def_id = st['def_id']
+            data_to_save = st.get('data', {})
+            self.db.update_task_definition(
+                user_id,
+                def_id,
+                name=data_to_save.get('name'),
+                frequency=data_to_save.get('frequency'),
+                days=data_to_save.get('days'),
+                reminder_time=data_to_save.get('reminder_time'),
+                check_time=data_to_save.get('check_time')
+            )
+            self.unschedule_task_definition(chat_id, def_id)
+            new_def = self.db.get_task_definition(user_id, def_id)
+            if new_def:
+                self.schedule_task_definition(chat_id, user_id, new_def)
+            self.edit_task_state.pop(chat_id, None)
+            await query.edit_message_text("✅ Изменения сохранены и расписание обновлено!")
+            return
+
     async def comment_message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка текстовых сообщений: комментарии и мастер добавления задач"""
         text = (update.message.text or '').strip()
         chat_id = update.effective_chat.id
         
+        # 0) Редактирование задач: обработка полей
+        st_edit = self.edit_task_state.get(chat_id)
+        if st_edit:
+            awaiting_kind = st_edit.get('awaiting')
+            if awaiting_kind == 'name':
+                if not text:
+                    await update.message.reply_text("Введите непустое название")
+                    return
+                st_edit.setdefault('data', {})
+                st_edit['data']['name'] = text[:64]
+                st_edit['awaiting'] = None
+                await update.message.reply_text("Название обновлено. Нажмите Сохранить или продолжите менять поля.")
+                return
+            if awaiting_kind == 'reminder_time':
+                if not utils.validate_time_format(text):
+                    await update.message.reply_text("Неверный формат. Введите время как HH:MM")
+                    return
+                st_edit.setdefault('data', {})
+                st_edit['data']['reminder_time'] = text
+                st_edit['awaiting'] = None
+                await update.message.reply_text("Время напоминания обновлено. Нажмите Сохранить или продолжите менять поля.")
+                return
+            if awaiting_kind == 'check_time':
+                if not utils.validate_time_format(text):
+                    await update.message.reply_text("Неверный формат. Введите время как HH:MM")
+                    return
+                st_edit.setdefault('data', {})
+                st_edit['data']['check_time'] = text
+                st_edit['awaiting'] = None
+                await update.message.reply_text("Время контроля обновлено. Нажмите Сохранить или продолжите менять поля.")
+                return
+
         # 1) Комментарии v1
         awaiting = context.user_data.get('awaiting_comment')
         if awaiting:
@@ -608,13 +829,18 @@ class TaskAssistantBot:
             await update.message.reply_text(f"📅 На сегодня ({today_str}) задач нет по расписанию.")
             return
         message = f"📋 Задачи на сегодня ({today_str}):\n\n"
+        keyboard = []
         for def_id, display_name in scheduled_today:
             if def_id in tasks_in_db:
                 status = "✅" if tasks_in_db[def_id].get('completed') else "⏳"
             else:
                 status = "⏳"
             message += f"• {display_name}: {status}\n"
-        await update.message.reply_text(message)
+            keyboard.append([
+                InlineKeyboardButton(f"✅ {display_name}", callback_data=f"v2_quick_yes_{def_id}_{today_str}"),
+                InlineKeyboardButton("❌", callback_data=f"v2_quick_no_{def_id}_{today_str}")
+            ])
+        await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
     
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /stats"""
@@ -653,6 +879,70 @@ class TaskAssistantBot:
         self.add_task_state[chat_id] = {'user_id': user_id, 'step': 'name'}
         await update.message.reply_text("Введите короткое название задачи (например, 'Медитация'):")
 
+    async def edittask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        user = self.db.get_user_by_chat_id(chat_id)
+        if not user:
+            await update.message.reply_text("Начните с /start")
+            return
+        user_id = user['id']
+        args = context.args if hasattr(context, 'args') else []
+        if not args:
+            await update.message.reply_text("Использование: /edittask <id>")
+            return
+        try:
+            def_id = int(args[0])
+        except ValueError:
+            await update.message.reply_text("Неверный id. Пример: /edittask 3")
+            return
+        d = self.db.get_task_definition(user_id, def_id)
+        if not d:
+            await update.message.reply_text("Задача не найдена или уже удалена.")
+            return
+        self.edit_task_state[chat_id] = {
+            'user_id': user_id,
+            'def_id': def_id,
+            'data': {
+                'name': d.get('name'),
+                'frequency': d.get('frequency'),
+                'days': d.get('days_list') or [],
+                'reminder_time': d.get('reminder_time'),
+                'check_time': d.get('check_time')
+            },
+            'awaiting': None
+        }
+        kb = [
+            [InlineKeyboardButton("Название", callback_data="edittask_field_name"), InlineKeyboardButton("Периодичность", callback_data="edittask_field_freq")],
+            [InlineKeyboardButton("Дни", callback_data="edittask_field_days")],
+            [InlineKeyboardButton("Время напоминания", callback_data="edittask_field_reminder")],
+            [InlineKeyboardButton("Время контроля", callback_data="edittask_field_check")],
+            [InlineKeyboardButton("Сохранить", callback_data="edittask_save"), InlineKeyboardButton("Отмена", callback_data="edittask_cancel")]
+        ]
+        await update.message.reply_text("Что изменить?", reply_markup=InlineKeyboardMarkup(kb))
+
+    async def deletetask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        user = self.db.get_user_by_chat_id(chat_id)
+        if not user:
+            await update.message.reply_text("Начните с /start")
+            return
+        user_id = user['id']
+        args = context.args if hasattr(context, 'args') else []
+        if not args:
+            await update.message.reply_text("Использование: /deletetask <id>")
+            return
+        try:
+            def_id = int(args[0])
+        except ValueError:
+            await update.message.reply_text("Неверный id. Пример: /deletetask 3")
+            return
+        ok = self.db.deactivate_task_definition(user_id, def_id)
+        if not ok:
+            await update.message.reply_text("Задача не найдена или уже удалена.")
+            return
+        self.unschedule_task_definition(chat_id, def_id)
+        await update.message.reply_text("🗑️ Задача удалена и расписание очищено.")
+
     async def mytasks_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         user = self.db.get_user_by_chat_id(chat_id)
@@ -661,16 +951,21 @@ class TaskAssistantBot:
             return
         defs = self.db.list_task_definitions(user['id'])
         if not defs:
-            await update.message.reply_text("У вас пока нет задач. Используйте /addtask")
+            kb = [[InlineKeyboardButton("➕ Добавить задачу", callback_data="start_addtask")]]
+            await update.message.reply_text("У вас пока нет задач. Нажмите, чтобы добавить:", reply_markup=InlineKeyboardMarkup(kb))
             return
-        lines = ["Ваши задачи:"]
+        lines = ["Ваши задачи (нажмите, чтобы управлять):"]
         days_names = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс']
         for d in defs:
             freq = 'Ежедневно' if (d.get('frequency') == 'daily') else 'По дням недели'
             days = d.get('days_list') or list(range(7))
             days_str = ','.join(days_names[i] for i in days)
             lines.append(f"• #{d['id']} {d['name']} — {freq}, дни: {days_str}, напоминание {d['reminder_time']}, контроль {d['check_time']}")
-        await update.message.reply_text('\n'.join(lines))
+        kb_rows = []
+        for d in defs:
+            kb_rows.append([InlineKeyboardButton(f"✏️ {d['name']} (#{d['id']})", callback_data=f"manage_def_{d['id']}")])
+        kb_rows.append([InlineKeyboardButton("➕ Добавить задачу", callback_data="start_addtask")])
+        await update.message.reply_text('\n'.join(lines), reply_markup=InlineKeyboardMarkup(kb_rows))
 
     async def show_days_keyboard(self, chat_id: int):
         st = self.add_task_state.get(chat_id) or {}
@@ -731,6 +1026,8 @@ async def main():
             BotCommand("help", "Помощь по командам"),
             BotCommand("addtask", "Добавить задачу"),
             BotCommand("mytasks", "Мои задачи"),
+            BotCommand("edittask", "Редактировать задачу"),
+            BotCommand("deletetask", "Удалить задачу"),
             BotCommand("today", "Задачи на сегодня"),
             BotCommand("stats", "Статистика за сегодня"),
             BotCommand("report", "Отчет за сегодня"),
@@ -774,6 +1071,8 @@ async def main():
     application.add_handler(CommandHandler("stop_bot", bot_instance.stop_bot_command))
     application.add_handler(CommandHandler("addtask", bot_instance.addtask_command))
     application.add_handler(CommandHandler("mytasks", bot_instance.mytasks_command))
+    application.add_handler(CommandHandler("edittask", bot_instance.edittask_command))
+    application.add_handler(CommandHandler("deletetask", bot_instance.deletetask_command))
     
     # Добавляем обработчик кнопок
     application.add_handler(CallbackQueryHandler(bot_instance.button_callback))
