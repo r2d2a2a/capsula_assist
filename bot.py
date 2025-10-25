@@ -403,6 +403,17 @@ class TaskAssistantBot:
             InlineKeyboardButton("Отмена", callback_data="edittask_cancel")
         ])
         return InlineKeyboardMarkup(rows)
+
+    def build_edit_menu_keyboard(self) -> InlineKeyboardMarkup:
+        """Клавиатура панели редактирования с кнопкой Сохранить."""
+        kb = [
+            [InlineKeyboardButton("Название", callback_data="edittask_field_name"), InlineKeyboardButton("Периодичность", callback_data="edittask_field_freq")],
+            [InlineKeyboardButton("Дни", callback_data="edittask_field_days")],
+            [InlineKeyboardButton("Время напоминания", callback_data="edittask_field_reminder")],
+            [InlineKeyboardButton("Время контроля", callback_data="edittask_field_check")],
+            [InlineKeyboardButton("Сохранить", callback_data="edittask_save"), InlineKeyboardButton("Отмена", callback_data="edittask_cancel")]
+        ]
+        return InlineKeyboardMarkup(kb)
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка нажатий на кнопки"""
@@ -624,10 +635,10 @@ class TaskAssistantBot:
                 await query.edit_message_text("Выберите дни недели. Нажимайте, затем 'Готово'.", reply_markup=self.build_days_keyboard_edit(days))
             elif field == 'reminder':
                 st['awaiting'] = 'reminder_time'
-                await query.edit_message_text("Введите новое время напоминания HH:MM:")
+                await query.edit_message_text("Введите новое время напоминания HH:MM:", reply_markup=self.build_edit_menu_keyboard())
             elif field == 'check':
                 st['awaiting'] = 'check_time'
-                await query.edit_message_text("Введите новое время контроля HH:MM:")
+                await query.edit_message_text("Введите новое время контроля HH:MM:", reply_markup=self.build_edit_menu_keyboard())
             return
 
         if data.startswith('edittask_freq_'):
@@ -639,7 +650,7 @@ class TaskAssistantBot:
             if st['data']['frequency'] == 'daily':
                 st['data']['days'] = list(range(7))
             self.edit_task_state[chat_id] = st
-            await query.edit_message_text("Периодичность обновлена. Нажмите Сохранить или продолжите менять поля.")
+            await query.edit_message_text("Периодичность обновлена. Нажмите Сохранить или продолжите менять поля.", reply_markup=self.build_edit_menu_keyboard())
             return
 
         if data.startswith('edittask_day_'):
@@ -658,7 +669,7 @@ class TaskAssistantBot:
             return
 
         if data == 'edittask_days_done':
-            await query.edit_message_text("Дни обновлены. Нажмите Сохранить или продолжите менять поля.")
+            await query.edit_message_text("Дни обновлены. Нажмите Сохранить или продолжите менять поля.", reply_markup=self.build_edit_menu_keyboard())
             return
 
         if data == 'edittask_cancel':
@@ -709,7 +720,7 @@ class TaskAssistantBot:
                 st_edit.setdefault('data', {})
                 st_edit['data']['name'] = text[:64]
                 st_edit['awaiting'] = None
-                await update.message.reply_text("Название обновлено. Нажмите Сохранить или продолжите менять поля.")
+                await self.send_message_to_chat(chat_id, "Название обновлено. Нажмите Сохранить или продолжите менять поля.", self.build_edit_menu_keyboard())
                 return
             if awaiting_kind == 'reminder_time':
                 if not utils.validate_time_format(text):
@@ -718,7 +729,7 @@ class TaskAssistantBot:
                 st_edit.setdefault('data', {})
                 st_edit['data']['reminder_time'] = text
                 st_edit['awaiting'] = None
-                await update.message.reply_text("Время напоминания обновлено. Нажмите Сохранить или продолжите менять поля.")
+                await self.send_message_to_chat(chat_id, "Время напоминания обновлено. Нажмите Сохранить или продолжите менять поля.", self.build_edit_menu_keyboard())
                 return
             if awaiting_kind == 'check_time':
                 if not utils.validate_time_format(text):
@@ -727,7 +738,7 @@ class TaskAssistantBot:
                 st_edit.setdefault('data', {})
                 st_edit['data']['check_time'] = text
                 st_edit['awaiting'] = None
-                await update.message.reply_text("Время контроля обновлено. Нажмите Сохранить или продолжите менять поля.")
+                await self.send_message_to_chat(chat_id, "Время контроля обновлено. Нажмите Сохранить или продолжите менять поля.", self.build_edit_menu_keyboard())
                 return
 
         # 1) Комментарии v1
@@ -911,14 +922,7 @@ class TaskAssistantBot:
             },
             'awaiting': None
         }
-        kb = [
-            [InlineKeyboardButton("Название", callback_data="edittask_field_name"), InlineKeyboardButton("Периодичность", callback_data="edittask_field_freq")],
-            [InlineKeyboardButton("Дни", callback_data="edittask_field_days")],
-            [InlineKeyboardButton("Время напоминания", callback_data="edittask_field_reminder")],
-            [InlineKeyboardButton("Время контроля", callback_data="edittask_field_check")],
-            [InlineKeyboardButton("Сохранить", callback_data="edittask_save"), InlineKeyboardButton("Отмена", callback_data="edittask_cancel")]
-        ]
-        await self.send_message_to_chat(chat_id, "Что изменить?", InlineKeyboardMarkup(kb))
+        await self.send_message_to_chat(chat_id, "Что изменить?", self.build_edit_menu_keyboard())
 
     async def deletetask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
