@@ -159,17 +159,8 @@ class TaskAssistantBot:
                 return
             # Отправляем напоминание
             message = f"⏰ Напоминание!\n\n📋 Время для: {task_name}\n🕐 {datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%H:%M')}"
-            
-            # Создаем клавиатуру для быстрого ответа
-            keyboard = [
-                [InlineKeyboardButton("✅ Выполнено", callback_data=f"quick_yes_{task_type}_{today}")],
-                [InlineKeyboardButton("❌ Не выполнено", callback_data=f"quick_no_{task_type}_{today}")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            # Отправляем сообщение (здесь нужно использовать application.bot)
-            # Это будет реализовано в main функции
-            await self.send_message_to_user(message, reply_markup)
+            # Напоминание отправляем без кнопок. Кнопки показываются только при контроле выполнения.
+            await self.send_message_to_user(message, reply_markup=None)
             
             # Флаг already set в acquire_send_lock
             
@@ -184,11 +175,8 @@ class TaskAssistantBot:
             if not lock_acquired:
                 return
             message = f"⏰ Напоминание!\n\n📋 Время для: {task_name}\n🕐 {datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%H:%M')}"
-            keyboard = [
-                [InlineKeyboardButton("✅ Выполнено", callback_data=f"v2_quick_yes_{task_def_id}_{today}")],
-                [InlineKeyboardButton("❌ Не выполнено", callback_data=f"v2_quick_no_{task_def_id}_{today}")]
-            ]
-            await self.send_message_to_chat(chat_id, message, InlineKeyboardMarkup(keyboard))
+            # Напоминание отправляем без кнопок. Кнопки показываются только при контроле выполнения.
+            await self.send_message_to_chat(chat_id, message, reply_markup=None)
         except Exception as e:
             logger.error(f"Ошибка при отправке напоминания v2: {e}")
     
@@ -881,7 +869,24 @@ class TaskAssistantBot:
         if not user:
             await update.message.reply_text("Начните с /start")
             return
-        await self.send_daily_report_v2(chat_id, user['id'])
+        # Пытаемся отправить полноценный отчет. Если что-то пойдет не так, даем простой ответ, чтобы команда не молчала.
+        try:
+            await self.send_daily_report_v2(chat_id, user['id'])
+        except Exception as e:
+            logger.error(f"/report: ошибка при формировании отчета: {e}")
+            try:
+                today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
+                stats = self.db.get_completion_stats_by_user(user['id'], today, today)
+                msg = (
+                    "📊 Отчет за сегодня (упрощенный):\n\n"
+                    f"• Всего задач: {stats['total_tasks']}\n"
+                    f"• Выполнено: {stats['completed_tasks']}\n"
+                    f"• Процент выполнения: {stats['completion_rate']}%"
+                )
+                await update.message.reply_text(msg)
+            except Exception as inner_e:
+                logger.error(f"/report: ошибка резервного ответа: {inner_e}")
+                await update.message.reply_text("Не удалось сформировать отчет. Попробуйте позже.")
 
     async def addtask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
