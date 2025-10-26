@@ -103,10 +103,15 @@ class TaskDatabase:
                 total_tasks INTEGER DEFAULT 0,
                 completed_tasks INTEGER DEFAULT 0,
                 completion_rate REAL DEFAULT 0.0,
-                user_id INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Миграция: добавить user_id в reports, если старая таблица без этого столбца
+        try:
+            cursor.execute('ALTER TABLE reports ADD COLUMN user_id INTEGER')
+        except sqlite3.OperationalError:
+            # Столбец уже существует
+            pass
         
         conn.commit()
         conn.close()
