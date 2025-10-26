@@ -1,7 +1,10 @@
 import sqlite3
 import datetime
+import logging
 from typing import List, Dict, Optional
 import pytz
+
+logger = logging.getLogger(__name__)
 
 class TaskDatabase:
     def __init__(self, db_path: str = 'tasks.db'):
@@ -107,11 +110,17 @@ class TaskDatabase:
             )
         ''')
         # Миграция: добавить user_id в reports, если старая таблица без этого столбца
-        try:
-            cursor.execute('ALTER TABLE reports ADD COLUMN user_id INTEGER')
-        except sqlite3.OperationalError:
-            # Столбец уже существует
-            pass
+        # Проверяем, есть ли уже колонка user_id
+        cursor.execute("PRAGMA table_info(reports)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'user_id' not in columns:
+            try:
+                cursor.execute('ALTER TABLE reports ADD COLUMN user_id INTEGER')
+                conn.commit()
+            except sqlite3.OperationalError as e:
+                # Ошибка при добавлении столбца
+                logger.error(f"Не удалось добавить колонку user_id в таблицу reports: {e}")
+                pass
         
         conn.commit()
         conn.close()
