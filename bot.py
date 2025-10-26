@@ -17,6 +17,12 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+# Убираем шум от httpx/httpcore (polling getUpdates)
+for noisy_logger in ["httpx", "httpcore"]:
+    try:
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+    except Exception:
+        pass
 
 class TaskAssistantBot:
     def __init__(self):
@@ -1060,6 +1066,18 @@ async def main():
         except Exception as e:
             logger.error(f"Ошибка при отправке сообщения: {e}")
     bot_instance.send_message_to_chat = send_message_to_chat
+    
+    # Автопланирование для всех существующих пользователей при старте (после рестарта сервиса)
+    try:
+        users = bot_instance.db.list_users()
+        for u in users:
+            chat_id = u.get('chat_id')
+            user_id = u.get('id')
+            if chat_id and user_id:
+                bot_instance.schedule_all_for_user(chat_id, user_id)
+        logger.info(f"Инициализировано расписание для {len(users)} пользователей")
+    except Exception as e:
+        logger.error(f"Ошибка автопланирования пользователей при старте: {e}")
     
     # Добавляем обработчики команд
     application.add_handler(CommandHandler("start", bot_instance.start))

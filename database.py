@@ -360,10 +360,12 @@ class TaskDatabase:
                 cursor.execute('UPDATE tasks SET reminder_sent = TRUE WHERE id = ?', (task_id,))
                 cursor.execute('COMMIT')
                 return True, task_id
+            # Вставляем синтетический task_type, чтобы удовлетворить NOT NULL и уникальный индекс (task_type, date)
+            synthetic_task_type = f"u{user_id}_d{task_def_id}"
             cursor.execute('''
-                INSERT INTO tasks (user_id, task_def_id, date, reminder_sent)
-                VALUES (?, ?, ?, TRUE)
-            ''', (user_id, task_def_id, date))
+                INSERT INTO tasks (user_id, task_def_id, task_type, date, reminder_sent)
+                VALUES (?, ?, ?, ?, TRUE)
+            ''', (user_id, task_def_id, synthetic_task_type, date))
             task_id = cursor.lastrowid
             cursor.execute('COMMIT')
             return True, task_id
@@ -393,10 +395,12 @@ class TaskDatabase:
                 cursor.execute('UPDATE tasks SET check_sent = TRUE WHERE id = ?', (task_id,))
                 cursor.execute('COMMIT')
                 return True, task_id
+            # Вставляем синтетический task_type аналогично acquire_send_lock_v2
+            synthetic_task_type = f"u{user_id}_d{task_def_id}"
             cursor.execute('''
-                INSERT INTO tasks (user_id, task_def_id, date, check_sent)
-                VALUES (?, ?, ?, TRUE)
-            ''', (user_id, task_def_id, date))
+                INSERT INTO tasks (user_id, task_def_id, task_type, date, check_sent)
+                VALUES (?, ?, ?, ?, TRUE)
+            ''', (user_id, task_def_id, synthetic_task_type, date))
             task_id = cursor.lastrowid
             cursor.execute('COMMIT')
             return True, task_id
