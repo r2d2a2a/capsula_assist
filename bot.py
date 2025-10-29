@@ -997,21 +997,47 @@ class TaskAssistantBot:
         markup = InlineKeyboardMarkup(rows)
         await self.send_message_to_chat(chat_id, "Выберите дни недели:", markup)
     
+    def unschedule_all_for_chat(self, chat_id: int):
+        """Удалить все задания напоминаний/проверок и отчётов для указанного чата."""
+        try:
+            for job in list(self.scheduler.get_jobs()):
+                jid = getattr(job, 'id', '')
+                if not isinstance(jid, str):
+                    continue
+                if (
+                    jid == f'daily_report_{chat_id}' or
+                    jid == f'weekly_report_{chat_id}' or
+                    jid.startswith(f'v2_reminder_{chat_id}_') or
+                    jid.startswith(f'v2_check_{chat_id}_')
+                ):
+                    try:
+                        self.scheduler.remove_job(jid)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    
     async def start_bot_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start_bot"""
+        chat_id = update.effective_chat.id
+        user = self.db.get_user_by_chat_id(chat_id)
+        if not user:
+            await update.message.reply_text("Начните с /start")
+            return
+        user_id = user['id']
+        # Перепланируем все задачи и отчёты только для текущего чата
+        self.schedule_all_for_user(chat_id, user_id)
+        # На всякий случай запускаем планировщик, если он не запущен (глобально)
         if not self.scheduler.running:
             self.scheduler.start()
-            await update.message.reply_text("🤖 Бот запущен! Напоминания активированы.")
-        else:
-            await update.message.reply_text("🤖 Бот уже запущен.")
+        await update.message.reply_text("🤖 Напоминания и отчёты для этого чата включены.")
     
     async def stop_bot_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /stop_bot"""
-        if self.scheduler.running:
-            self.scheduler.shutdown()
-            await update.message.reply_text("⏹️ Бот остановлен. Напоминания отключены.")
-        else:
-            await update.message.reply_text("⏹️ Бот уже остановлен.")
+        chat_id = update.effective_chat.id
+        # Снимаем все задания только для текущего чата, не останавливая глобальный планировщик
+        self.unschedule_all_for_chat(chat_id)
+        await update.message.reply_text("⏹️ Напоминания и отчёты для этого чата отключены.")
 
 # Глобальная переменная для хранения экземпляра бота
 bot_instance = None
