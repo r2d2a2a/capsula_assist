@@ -51,6 +51,7 @@ class TaskDatabase:
                 days TEXT,               -- список дней недели через запятую: "0,1,2,3,4,5,6"
                 reminder_time TEXT NOT NULL, -- HH:MM
                 check_time TEXT NOT NULL,    -- HH:MM
+                one_time_date TEXT,          -- Дата одноразовой задачи YYYY-MM-DD
                 active BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(user_id) REFERENCES users(id)
@@ -136,6 +137,12 @@ class TaskDatabase:
                 # Ошибка при добавлении столбца
                 logger.error(f"Не удалось добавить колонку user_id в таблицу reports: {e}")
                 pass
+
+        # Миграция: добавить one_time_date в task_definitions, если её нет
+        try:
+            cursor.execute('ALTER TABLE task_definitions ADD COLUMN one_time_date TEXT')
+        except sqlite3.OperationalError:
+            pass
         
         conn.commit()
         conn.close()
@@ -308,15 +315,16 @@ class TaskDatabase:
         conn.close()
         return (row[0] or 0)
 
-    def add_task_definition(self, user_id: int, name: str, frequency: str, days: List[int], reminder_time: str, check_time: str) -> int:
-        """Создать определение задачи. days — список [0..6]."""
+    def add_task_definition(self, user_id: int, name: str, frequency: str, days: List[int], reminder_time: str, check_time: str,
+                            one_time_date: Optional[str] = None) -> int:
+        """Создать определение задачи. days — список [0..6]. Для одноразовых задач передавайте one_time_date."""
         days_str = ','.join(str(d) for d in sorted(set(days))) if days else ''
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO task_definitions (user_id, name, frequency, days, reminder_time, check_time)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, name, frequency, days_str, reminder_time, check_time))
+            INSERT INTO task_definitions (user_id, name, frequency, days, reminder_time, check_time, one_time_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, name, frequency, days_str, reminder_time, check_time, one_time_date))
         def_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -351,7 +359,8 @@ class TaskDatabase:
         return result
 
     def update_task_definition(self, user_id: int, def_id: int, name: Optional[str] = None, frequency: Optional[str] = None,
-                                days: Optional[List[int]] = None, reminder_time: Optional[str] = None, check_time: Optional[str] = None) -> bool:
+                                days: Optional[List[int]] = None, reminder_time: Optional[str] = None, check_time: Optional[str] = None,
+                                one_time_date: Optional[str] = None) -> bool:
         """Обновить поля определения задачи. Возвращает True, если обновлено >=1 строк."""
         set_parts = []
         params: List = []
@@ -371,6 +380,9 @@ class TaskDatabase:
         if check_time is not None:
             set_parts.append('check_time = ?')
             params.append(check_time)
+        if one_time_date is not None:
+            set_parts.append('one_time_date = ?')
+            params.append(one_time_date)
         if not set_parts:
             return False
         params.extend([def_id, user_id])

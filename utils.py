@@ -4,7 +4,8 @@
 
 import datetime
 import pytz
-from typing import Dict, List
+from typing import Dict, List, Optional
+from urllib.parse import quote
 
 def get_moscow_time() -> datetime.datetime:
     """Получить текущее время в московском часовом поясе"""
@@ -113,3 +114,27 @@ def get_next_occurrence(day_name: str, time_str: str) -> datetime.datetime:
     next_occurrence = next_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
     
     return next_occurrence
+
+def validate_date_format(date_str: str) -> bool:
+    """Проверить формат даты YYYY-MM-DD."""
+    try:
+        datetime.datetime.strptime(date_str, '%Y-%m-%d')
+        return True
+    except ValueError:
+        return False
+
+def build_google_calendar_link(title: str, start_dt: datetime.datetime, end_dt: datetime.datetime,
+                               timezone: str, description: Optional[str] = None) -> str:
+    """Сформировать ссылку для добавления события в Google Calendar."""
+    description = description or ""
+    start_utc = start_dt.astimezone(pytz.UTC)
+    end_utc = end_dt.astimezone(pytz.UTC)
+    fmt = "%Y%m%dT%H%M%SZ"
+    dates_param = f"{start_utc.strftime(fmt)}/{end_utc.strftime(fmt)}"
+    return (
+        "https://calendar.google.com/calendar/render?"
+        f"action=TEMPLATE&text={quote(title)}"
+        f"&dates={dates_param}"
+        f"&details={quote(description)}"
+        f"&ctz={quote(timezone)}"
+    )

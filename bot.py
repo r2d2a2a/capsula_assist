@@ -6,6 +6,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotComm
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 from config import BOT_TOKEN, DEFAULT_TIMEZONE, TASKS_SCHEDULE
 from database import TaskDatabase
@@ -100,6 +101,64 @@ class TaskAssistantBot:
             return raw
         except Exception:
             return None
+
+    def _make_local_datetime(self, date_str: str, time_str: str, tz) -> Optional[datetime.datetime]:
+        """Собрать локальный datetime из строки даты/времени в часовом поясе пользователя."""
+        try:
+            hour, minute = map(int, time_str.split(':'))
+            date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+            return tz.localize(datetime.datetime(date_obj.year, date_obj.month, date_obj.day, hour, minute, 0))
+        except Exception as e:
+            logger.error(f"Не удалось собрать дату {date_str} {time_str}: {e}")
+            return None
+
+    def _get_next_occurrence_for_def(self, task_def: Dict, tz) -> Optional[datetime.datetime]:
+        """Вычислить ближайшее время напоминания для задачи с учетом периодичности."""
+        now = datetime.datetime.now(tz)
+        reminder_time = task_def.get('reminder_time')
+        if not reminder_time:
+            return None
+        freq = task_def.get('frequency')
+        if freq == 'once':
+            date_str = task_def.get('one_time_date')
+            if not date_str:
+                return None
+            dt = self._make_local_datetime(date_str, reminder_time, tz)
+            if dt and dt >= now:
+                return dt
+            return None
+        days_list = task_def.get('days_list') or list(range(7))
+        for offset in range(0, 8):
+            candidate = now + datetime.timedelta(days=offset)
+            if candidate.weekday() in days_list:
+                candidate_dt = candidate.replace(hour=int(reminder_time.split(':')[0]), minute=int(reminder_time.split(':')[1]),
+                                                 second=0, microsecond=0)
+                if candidate_dt >= now:
+                    return candidate_dt
+        return None
+
+    def _build_calendar_link_for_def(self, task_def: Dict, tz) -> Optional[str]:
+        """Сформировать ссылку для добавления ближайшего события в Google Calendar."""
+        start_dt = self._get_next_occurrence_for_def(task_def, tz)
+        if not start_dt:
+            return None
+        check_time = task_def.get('check_time')
+        end_dt = None
+        if check_time:
+            end_candidate = self._make_local_datetime(start_dt.strftime('%Y-%m-%d'), check_time, tz)
+            if end_candidate and end_candidate > start_dt:
+                end_dt = end_candidate
+        if not end_dt:
+            end_dt = start_dt + datetime.timedelta(minutes=30)
+        tz_name = getattr(tz, 'zone', None) or getattr(tz, 'key', None) or DEFAULT_TIMEZONE
+        return utils.build_google_calendar_link(task_def.get('name', 'Task'), start_dt, end_dt, tz_name, "Создано через капсулу ассистента")
+
+    def _build_reminder_keyboard(self, def_id: int, date_str: str) -> InlineKeyboardMarkup:
+        """Клавиатура напоминания с кнопкой Snooze."""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏰ Напомнить через 30 мин", callback_data=f"v2_snooze_{def_id}_{date_str}_30")],
+            [InlineKeyboardButton("❌ Пропустить напоминание", callback_data=f"v2_skip_reminder_{def_id}_{date_str}")]
+        ])
     
     def setup_scheduler(self):
         """Базовая инициализация планировщика (планирования добавляются по пользователям)."""
@@ -132,11 +191,38 @@ class TaskAssistantBot:
 
     def schedule_task_definition(self, chat_id: int, user_id: int, task_def: Dict):
         tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+        def_id = task_def['id']
+        name = task_def['name']
+        freq = task_def.get('frequency')
+        # Одноразовая задача: планируем точные даты через DateTrigger
+        if freq == 'once':
+            date_str = task_def.get('one_time_date')
+            reminder_dt = self._make_local_datetime(date_str, task_def['reminder_time'], tz) if date_str else None
+            check_dt = self._make_local_datetime(date_str, task_def['check_time'], tz) if date_str else None
+            now = datetime.datetime.now(tz)
+            if reminder_dt and reminder_dt > now:
+                r_job_id = f'v2_reminder_{chat_id}_{def_id}_once'
+                self.scheduler.add_job(
+                    self.send_task_reminder_v2,
+                    DateTrigger(run_date=reminder_dt.astimezone(pytz.UTC)),
+                    args=[chat_id, user_id, def_id, name],
+                    id=r_job_id,
+                    replace_existing=True
+                )
+            if check_dt and check_dt > now:
+                c_job_id = f'v2_check_{chat_id}_{def_id}_once'
+                self.scheduler.add_job(
+                    self.send_completion_check_v2,
+                    DateTrigger(run_date=check_dt.astimezone(pytz.UTC)),
+                    args=[chat_id, user_id, def_id, name],
+                    id=c_job_id,
+                    replace_existing=True
+                )
+            return
+
         days: List[int] = task_def.get('days_list') or list(range(7))
         rh, rm = map(int, task_def['reminder_time'].split(':'))
         ch, cm = map(int, task_def['check_time'].split(':'))
-        def_id = task_def['id']
-        name = task_def['name']
         for day in days:
             r_job_id = f'v2_reminder_{chat_id}_{def_id}_{day}_{rh:02d}{rm:02d}'
             c_job_id = f'v2_check_{chat_id}_{def_id}_{day}_{ch:02d}{cm:02d}'
@@ -165,14 +251,88 @@ class TaskAssistantBot:
                         self.scheduler.remove_job(jid)
                     except Exception:
                         pass
+                if isinstance(jid, str) and jid.startswith(f'snooze_{chat_id}_{def_id}_'):
+                    try:
+                        self.scheduler.remove_job(jid)
+                    except Exception:
+                        pass
         except Exception:
             pass
+
+    def catch_up_missed_for_user(self, chat_id: int, user_id: int):
+        """Догнать пропущенные напоминания/контроль для текущего дня после простоя."""
+        tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+        now = datetime.datetime.now(tz)
+        today_str = now.strftime('%Y-%m-%d')
+        weekday = now.weekday()
+        defs = self.db.list_task_definitions(user_id)
+        for d in defs:
+            freq = d.get('frequency')
+            if freq == 'once':
+                date_str = d.get('one_time_date')
+                if date_str != today_str:
+                    continue
+            else:
+                days_list = d.get('days_list') or list(range(7))
+                if weekday not in days_list:
+                    continue
+                date_str = today_str
+
+            # Напоминание
+            reminder_dt = self._make_local_datetime(date_str, d.get('reminder_time'), tz)
+            if reminder_dt and reminder_dt <= now:
+                lock_acquired, _ = self.db.acquire_send_lock_v2(user_id, d['id'], date_str)
+                if lock_acquired:
+                    run_time = datetime.datetime.now(pytz.UTC) + datetime.timedelta(seconds=1)
+                    job_id = f'catchup_reminder_{chat_id}_{d["id"]}_{date_str}'
+                    self.scheduler.add_job(
+                        self.send_task_reminder_v2,
+                        DateTrigger(run_date=run_time),
+                        args=[chat_id, user_id, d['id'], d.get('name'), True, False],
+                        id=job_id,
+                        replace_existing=True
+                    )
+
+            # Контроль выполнения
+            check_dt = self._make_local_datetime(date_str, d.get('check_time'), tz)
+            if check_dt and check_dt <= now:
+                lock_acquired, _ = self.db.acquire_check_lock_v2(user_id, d['id'], date_str)
+                if lock_acquired:
+                    run_time = datetime.datetime.now(pytz.UTC) + datetime.timedelta(seconds=2)
+                    job_id = f'catchup_check_{chat_id}_{d["id"]}_{date_str}'
+                    self.scheduler.add_job(
+                        self.send_completion_check_v2,
+                        DateTrigger(run_date=run_time),
+                        args=[chat_id, user_id, d['id'], d.get('name'), True],
+                        id=job_id,
+                        replace_existing=True
+                    )
+
+    def schedule_snoozed_reminder(self, chat_id: int, user_id: int, task_def_id: int, task_name: str,
+                                  delay_minutes: int):
+        """Запланировать одноразовое напоминание после Snooze."""
+        tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+        run_time_local = datetime.datetime.now(tz) + datetime.timedelta(minutes=delay_minutes)
+        run_time_utc = run_time_local.astimezone(pytz.UTC)
+        job_id = f'snooze_{chat_id}_{task_def_id}_{int(run_time_utc.timestamp())}'
+        self.scheduler.add_job(
+            self.send_task_reminder_v2,
+            DateTrigger(run_date=run_time_utc),
+            args=[chat_id, user_id, task_def_id, task_name, False, True],
+            id=job_id,
+            replace_existing=False
+        )
 
     def schedule_all_for_user(self, chat_id: int, user_id: int):
         defs = self.db.list_task_definitions(user_id)
         for d in defs:
             self.schedule_task_definition(chat_id, user_id, d)
         self.schedule_reports_for_user(chat_id, user_id)
+        # После планирования догоняем пропущенные события текущего дня
+        try:
+            self.catch_up_missed_for_user(chat_id, user_id)
+        except Exception as e:
+            logger.error(f"catch_up_missed_for_user error: {e}")
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start"""
@@ -271,18 +431,23 @@ class TaskAssistantBot:
         except Exception as e:
             logger.error(f"Ошибка при отправке напоминания: {e}")
     
-    async def send_task_reminder_v2(self, chat_id: int, user_id: int, task_def_id: int, task_name: str):
+    async def send_task_reminder_v2(self, chat_id: int, user_id: int, task_def_id: int, task_name: str,
+                                    catch_up: bool = False, snoozed: bool = False):
         """Многопользовательское напоминание."""
         try:
             tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
             now = datetime.datetime.now(tz)
             today = now.strftime('%Y-%m-%d')
-            lock_acquired, _ = self.db.acquire_send_lock_v2(user_id, task_def_id, today)
-            if not lock_acquired:
-                return
+            if not snoozed:
+                lock_acquired, _ = self.db.acquire_send_lock_v2(user_id, task_def_id, today)
+                if not lock_acquired:
+                    return
             message = f"⏰ Напоминание!\n\n📋 Время для: {task_name}\n🕐 {now.strftime('%H:%M')}"
-            # Напоминание отправляем без кнопок. Кнопки показываются только при контроле выполнения.
-            await self.send_message_to_chat(chat_id, message, reply_markup=None)
+            if snoozed:
+                message += "\n\n🔁 Повторное напоминание после Snooze."
+            if catch_up:
+                message += "\n\n⚠️ Отправлено после простоя сервера."
+            await self.send_message_to_chat(chat_id, message, reply_markup=self._build_reminder_keyboard(task_def_id, today))
         except Exception as e:
             logger.error(f"Ошибка при отправке напоминания v2: {e}")
     
@@ -310,7 +475,7 @@ class TaskAssistantBot:
         except Exception as e:
             logger.error(f"Ошибка при отправке проверки: {e}")
     
-    async def send_completion_check_v2(self, chat_id: int, user_id: int, task_def_id: int, task_name: str):
+    async def send_completion_check_v2(self, chat_id: int, user_id: int, task_def_id: int, task_name: str, catch_up: bool = False):
         try:
             tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
             now = datetime.datetime.now(tz)
@@ -319,6 +484,8 @@ class TaskAssistantBot:
             if not lock_acquired:
                 return
             message = f"🔍 Контроль выполнения!\n\n📋 Задача: {task_name}\n⏰ Время проверки: {now.strftime('%H:%M')}\n\nВыполнили ли вы эту задачу?"
+            if catch_up:
+                message += "\n\n⚠️ Проверка отправлена после простоя сервера."
             keyboard = [
                 [InlineKeyboardButton("✅ Да, выполнил", callback_data=f"v2_check_yes_{task_def_id}_{today}")],
                 [InlineKeyboardButton("❌ Нет, не выполнил", callback_data=f"v2_check_no_{task_def_id}_{today}")]
@@ -512,7 +679,7 @@ class TaskAssistantBot:
         """Клавиатура панели редактирования с кнопкой Сохранить."""
         kb = [
             [InlineKeyboardButton("Название", callback_data="edittask_field_name"), InlineKeyboardButton("Периодичность", callback_data="edittask_field_freq")],
-            [InlineKeyboardButton("Дни", callback_data="edittask_field_days")],
+            [InlineKeyboardButton("Дни", callback_data="edittask_field_days"), InlineKeyboardButton("Дата (одноразовая)", callback_data="edittask_field_date")],
             [InlineKeyboardButton("Время напоминания", callback_data="edittask_field_reminder")],
             [InlineKeyboardButton("Время контроля", callback_data="edittask_field_check")],
             [InlineKeyboardButton("Сохранить", callback_data="edittask_save"), InlineKeyboardButton("Отмена", callback_data="edittask_cancel")]
@@ -800,14 +967,45 @@ class TaskAssistantBot:
             await query.edit_message_text("✅ Комментарий пропущен.")
             return
 
+        if data.startswith('v2_snooze_'):
+            parts = data.split('_')
+            def_id = int(parts[2])
+            minutes = int(parts[4]) if len(parts) > 4 else 30
+            chat_id = update.effective_chat.id
+            user = self.db.get_user_by_chat_id(chat_id)
+            if not user:
+                await query.edit_message_text("Начните с /start")
+                return
+            user_id = user['id']
+            task_def = self.db.get_task_definition(user_id, def_id)
+            if not task_def:
+                await query.edit_message_text("Задача не найдена.")
+                return
+            self.schedule_snoozed_reminder(chat_id, user_id, def_id, task_def.get('name'), minutes)
+            tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+            new_time = datetime.datetime.now(tz) + datetime.timedelta(minutes=minutes)
+            date_label = new_time.strftime('%Y-%m-%d %H:%M')
+            await query.edit_message_text(f"⏰ Напомню позже в {date_label} ({self._format_timezone(self.db.get_user_timezone(user_id))}).")
+            return
+
+        if data.startswith('v2_skip_reminder_'):
+            await query.edit_message_text("🛑 Напоминание пропущено. Контроль придет по расписанию.")
+            return
+
         # ----- Добавление задачи: выбор периодичности и дней -----
         if data.startswith('addtask_freq_'):
             freq = data.split('_')[2]
             chat_id = update.effective_chat.id
             st = self.add_task_state.get(chat_id) or {}
-            st['frequency'] = 'daily' if freq == 'daily' else 'weekly'
+            if freq == 'once':
+                st['frequency'] = 'once'
+            else:
+                st['frequency'] = 'daily' if freq == 'daily' else 'weekly'
             self.add_task_state[chat_id] = st
-            if st['frequency'] == 'daily':
+            if st['frequency'] == 'once':
+                st['awaiting'] = 'one_time_date'
+                await query.edit_message_text("Укажите дату (одноразовая задача) в формате YYYY-MM-DD")
+            elif st['frequency'] == 'daily':
                 await query.edit_message_text("Вы выбрали: ежедневно. Укажите время напоминания в формате HH:MM")
                 st['awaiting'] = 'reminder_time'
             else:
@@ -859,7 +1057,8 @@ class TaskAssistantBot:
             elif field == 'freq':
                 keyboard = [[
                     InlineKeyboardButton("Ежедневно", callback_data="edittask_freq_daily"),
-                    InlineKeyboardButton("По дням недели", callback_data="edittask_freq_weekly")
+                    InlineKeyboardButton("По дням недели", callback_data="edittask_freq_weekly"),
+                    InlineKeyboardButton("Одноразово", callback_data="edittask_freq_once")
                 ], [InlineKeyboardButton("Отмена", callback_data="edittask_cancel")]]
                 await query.edit_message_text("Выберите периодичность:", reply_markup=InlineKeyboardMarkup(keyboard))
             elif field == 'days':
@@ -871,6 +1070,9 @@ class TaskAssistantBot:
             elif field == 'check':
                 st['awaiting'] = 'check_time'
                 await query.edit_message_text("Введите новое время контроля HH:MM:", reply_markup=self.build_edit_menu_keyboard())
+            elif field == 'date':
+                st['awaiting'] = 'one_time_date'
+                await query.edit_message_text("Введите дату одноразовой задачи в формате YYYY-MM-DD:", reply_markup=self.build_edit_menu_keyboard())
             return
 
         if data.startswith('edittask_freq_'):
@@ -878,9 +1080,13 @@ class TaskAssistantBot:
             st = self.edit_task_state.get(chat_id) or {}
             freq = data.split('_')[2]
             st.setdefault('data', {})
-            st['data']['frequency'] = 'daily' if freq == 'daily' else 'weekly'
-            if st['data']['frequency'] == 'daily':
-                st['data']['days'] = list(range(7))
+            if freq == 'once':
+                st['data']['frequency'] = 'once'
+                st['data']['days'] = []
+            else:
+                st['data']['frequency'] = 'daily' if freq == 'daily' else 'weekly'
+                if st['data']['frequency'] == 'daily':
+                    st['data']['days'] = list(range(7))
             self.edit_task_state[chat_id] = st
             await query.edit_message_text("Периодичность обновлена. Нажмите Сохранить или продолжите менять поля.", reply_markup=self.build_edit_menu_keyboard())
             return
@@ -926,7 +1132,8 @@ class TaskAssistantBot:
                 frequency=data_to_save.get('frequency'),
                 days=data_to_save.get('days'),
                 reminder_time=data_to_save.get('reminder_time'),
-                check_time=data_to_save.get('check_time')
+                check_time=data_to_save.get('check_time'),
+                one_time_date=data_to_save.get('one_time_date')
             )
             self.unschedule_task_definition(chat_id, def_id)
             new_def = self.db.get_task_definition(user_id, def_id)
@@ -991,6 +1198,20 @@ class TaskAssistantBot:
                 st_edit['awaiting'] = None
                 await self.send_message_to_chat(chat_id, "Время контроля обновлено. Нажмите Сохранить или продолжите менять поля.", self.build_edit_menu_keyboard())
                 return
+            if awaiting_kind == 'one_time_date':
+                if not utils.validate_date_format(text):
+                    await update.message.reply_text("Неверный формат даты. Используйте YYYY-MM-DD")
+                    return
+                tz = self._tzinfo_from_string(self.db.get_user_timezone(st_edit['user_id']))
+                date_obj = datetime.datetime.strptime(text, '%Y-%m-%d').date()
+                if date_obj < datetime.datetime.now(tz).date():
+                    await update.message.reply_text("Дата уже прошла. Укажите будущую дату.")
+                    return
+                st_edit.setdefault('data', {})
+                st_edit['data']['one_time_date'] = text
+                st_edit['awaiting'] = None
+                await self.send_message_to_chat(chat_id, "Дата одноразовой задачи обновлена. Нажмите Сохранить или продолжите менять поля.", self.build_edit_menu_keyboard())
+                return
 
         # 1) Комментарии v1
         awaiting = context.user_data.get('awaiting_comment')
@@ -1033,11 +1254,26 @@ class TaskAssistantBot:
                 InlineKeyboardButton("Ежедневно", callback_data="addtask_freq_daily"),
                 InlineKeyboardButton("По дням недели", callback_data="addtask_freq_weekly")
             ], [
+                InlineKeyboardButton("Одноразово", callback_data="addtask_freq_once")
+            ], [
                 InlineKeyboardButton("Отмена", callback_data="addtask_cancel")
             ]]
             await update.message.reply_text("Выберите периодичность:", reply_markup=InlineKeyboardMarkup(keyboard))
             return
         awaiting_kind = st.get('awaiting')
+        if awaiting_kind == 'one_time_date':
+            if not utils.validate_date_format(text):
+                await update.message.reply_text("Неверный формат даты. Используйте YYYY-MM-DD")
+                return
+            tz = self._tzinfo_from_string(self.db.get_user_timezone(st.get('user_id')))
+            date_obj = datetime.datetime.strptime(text, '%Y-%m-%d').date()
+            if date_obj < datetime.datetime.now(tz).date():
+                await update.message.reply_text("Дата уже прошла. Укажите будущую дату.")
+                return
+            st['one_time_date'] = text
+            st['awaiting'] = 'reminder_time'
+            await update.message.reply_text("Укажите время напоминания в формате HH:MM")
+            return
         if awaiting_kind == 'reminder_time':
             if not utils.validate_time_format(text):
                 await update.message.reply_text("Неверный формат. Введите время как HH:MM")
@@ -1057,13 +1293,23 @@ class TaskAssistantBot:
             else:
                 user_id = user['id']
             frequency = st.get('frequency') or 'daily'
-            days = st.get('days') if frequency == 'weekly' else list(range(7))
-            def_id = self.db.add_task_definition(user_id, st['name'], frequency, days or list(range(7)), st['reminder_time'], st['check_time'])
+            if frequency == 'weekly':
+                days = st.get('days') or []
+            elif frequency == 'daily':
+                days = list(range(7))
+            else:
+                days = []
+            def_id = self.db.add_task_definition(user_id, st['name'], frequency, days or list(range(7)), st['reminder_time'], st['check_time'], st.get('one_time_date'))
             # Планируем
             saved_defs = self.db.list_task_definitions(user_id)
             target_def = next((d for d in saved_defs if d['id'] == def_id), None)
             if target_def:
                 self.schedule_task_definition(chat_id, user_id, target_def)
+                tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+                calendar_link = self._build_calendar_link_for_def(target_def, tz)
+                if calendar_link:
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Добавить в Google Calendar", url=calendar_link)]])
+                    await self.send_message_to_chat(chat_id, "📅 Добавить задачу в Google Calendar?", kb)
             await update.message.reply_text("✅ Задача добавлена и запланирована!")
             self.add_task_state.pop(chat_id, None)
             return
@@ -1084,9 +1330,14 @@ class TaskAssistantBot:
         tasks_in_db = {t.get('task_def_id'): t for t in self.db.get_tasks_for_date_by_user(user_id, today_str)}
         scheduled_today = []
         for d in defs:
-            days_list = d.get('days_list') or list(range(7))
-            if weekday in days_list:
-                scheduled_today.append((d['id'], d['name']))
+            freq = d.get('frequency')
+            if freq == 'once':
+                if d.get('one_time_date') == today_str:
+                    scheduled_today.append((d['id'], d['name']))
+            else:
+                days_list = d.get('days_list') or list(range(7))
+                if weekday in days_list:
+                    scheduled_today.append((d['id'], d['name']))
         if not scheduled_today:
             await self.send_message_to_chat(chat_id, f"📅 На сегодня ({today_str}) задач нет по расписанию.")
             return
@@ -1188,7 +1439,8 @@ class TaskAssistantBot:
                 'frequency': d.get('frequency'),
                 'days': d.get('days_list') or [],
                 'reminder_time': d.get('reminder_time'),
-                'check_time': d.get('check_time')
+                'check_time': d.get('check_time'),
+                'one_time_date': d.get('one_time_date')
             },
             'awaiting': None
         }
@@ -1231,10 +1483,19 @@ class TaskAssistantBot:
         lines = ["Ваши задачи (нажмите, чтобы управлять):"]
         days_names = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс']
         for d in defs:
-            freq = 'Ежедневно' if (d.get('frequency') == 'daily') else 'По дням недели'
-            days = d.get('days_list') or list(range(7))
-            days_str = ','.join(days_names[i] for i in days)
-            lines.append(f"• #{d['id']} {d['name']} — {freq}, дни: {days_str}, напоминание {d['reminder_time']}, контроль {d['check_time']}")
+            freq_value = d.get('frequency')
+            if freq_value == 'daily':
+                freq = 'Ежедневно'
+                days = d.get('days_list') or list(range(7))
+                freq_details = f"дни: {','.join(days_names[i] for i in days)}"
+            elif freq_value == 'weekly':
+                freq = 'По дням недели'
+                days = d.get('days_list') or []
+                freq_details = f"дни: {','.join(days_names[i] for i in days)}"
+            else:
+                freq = 'Одноразово'
+                freq_details = f"дата: {d.get('one_time_date') or '?'}"
+            lines.append(f"• #{d['id']} {d['name']} — {freq}, {freq_details}, напоминание {d['reminder_time']}, контроль {d['check_time']}")
         kb_rows = []
         for d in defs:
             kb_rows.append([InlineKeyboardButton(f"✏️ {d['name']} (#{d['id']})", callback_data=f"manage_def_{d['id']}")])
@@ -1267,7 +1528,8 @@ class TaskAssistantBot:
                     jid == f'daily_report_{chat_id}' or
                     jid == f'weekly_report_{chat_id}' or
                     jid.startswith(f'v2_reminder_{chat_id}_') or
-                    jid.startswith(f'v2_check_{chat_id}_')
+                    jid.startswith(f'v2_check_{chat_id}_') or
+                    jid.startswith(f'snooze_{chat_id}_')
                 ):
                     try:
                         self.scheduler.remove_job(jid)
