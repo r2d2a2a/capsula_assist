@@ -139,8 +139,8 @@ class TaskAssistantBot:
 /today - Показать задачи на сегодня
 /stats - Показать статистику за сегодня
 /report - Получить отчет за сегодня
- /edittask <id> - Редактировать задачу
- /deletetask <id> - Удалить задачу
+ /edittask - Редактировать задачу (список с кнопками)
+ /deletetask - Удалить задачу (список с кнопками)
  
 🔧 Управление:
 /start_bot - Запустить напоминания
@@ -408,6 +408,46 @@ class TaskAssistantBot:
             [InlineKeyboardButton("Сохранить", callback_data="edittask_save"), InlineKeyboardButton("Отмена", callback_data="edittask_cancel")]
         ]
         return InlineKeyboardMarkup(kb)
+
+    def build_tasks_list_keyboard(self, defs: List[Dict], action: str, page: int, page_size: int = 5) -> InlineKeyboardMarkup:
+        """Унифицированная клавиатура списка задач с пагинацией для редактирования/удаления."""
+        prefix = "editlist" if action == "edit" else "dellist"
+        start = max(page, 0) * page_size
+        end = start + page_size
+        rows: List[List[InlineKeyboardButton]] = []
+        for d in defs[start:end]:
+            rows.append([InlineKeyboardButton(f"{d.get('name')} (#{d.get('id')})", callback_data=f"{prefix}_choose_{d.get('id')}_{page}")])
+        total_pages = max(1, (len(defs) - 1) // page_size + 1)
+        nav_row: List[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"{prefix}_page_{page-1}"))
+        if end < len(defs):
+            nav_row.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"{prefix}_page_{page+1}"))
+        if nav_row:
+            rows.append(nav_row)
+        rows.append([InlineKeyboardButton("Отмена", callback_data=f"{prefix}_cancel")])
+        return InlineKeyboardMarkup(rows)
+
+    async def show_task_picker(self, chat_id: int, user_id: int, action: str, page: int = 0, query=None):
+        """Отображает список задач с пагинацией для выбора действия (edit/delete)."""
+        defs = self.db.list_task_definitions(user_id)
+        if not defs:
+            text = "У вас пока нет задач. Добавьте новую командой /addtask."
+            if query:
+                await query.edit_message_text(text)
+            else:
+                await self.send_message_to_chat(chat_id, text)
+            return
+        page_size = 5
+        total_pages = max(1, (len(defs) - 1) // page_size + 1)
+        safe_page = min(max(page, 0), total_pages - 1)
+        action_text = "редактирования" if action == "edit" else "удаления"
+        text = f"Выберите задачу для {action_text} (страница {safe_page + 1}/{total_pages}):"
+        markup = self.build_tasks_list_keyboard(defs, action, safe_page, page_size=page_size)
+        if query:
+            await query.edit_message_text(text, reply_markup=markup)
+        else:
+            await self.send_message_to_chat(chat_id, text, markup)
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка нажатий на кнопки"""
@@ -415,6 +455,55 @@ class TaskAssistantBot:
         await query.answer()
         
         data = query.data
+
+        # ----- Пагинация списков задач для редактирования/удаления -----
+        if data.startswith(('editlist_', 'dellist_')):
+            chat_id = update.effective_chat.id
+            user = self.db.get_user_by_chat_id(chat_id)
+            if not user:
+                await query.edit_message_text("Начните с /start")
+                return
+            user_id = user['id']
+            parts = data.split('_')
+            prefix = parts[0]
+            if parts[1] == 'page':
+                page = int(parts[2])
+                action = 'edit' if prefix == 'editlist' else 'delete'
+                await self.show_task_picker(chat_id, user_id, action, page=page, query=query)
+                return
+            if parts[1] == 'choose':
+                def_id = int(parts[2])
+                page = int(parts[3]) if len(parts) > 3 else 0
+                if prefix == 'editlist':
+                    class _Ctx:
+                        args = [str(def_id)]
+                    await self.edittask_command(update, _Ctx())
+                else:
+                    kb = [
+                        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"dellist_confirm_{def_id}_{page}")],
+                        [InlineKeyboardButton("⬅️ Назад", callback_data=f"dellist_page_{page}")]
+                    ]
+                    await query.edit_message_text("Удалить задачу? Это действие отменит расписание.", reply_markup=InlineKeyboardMarkup(kb))
+                return
+            if parts[1] == 'cancel':
+                await query.edit_message_text("Действие отменено.")
+                return
+            if parts[1] == 'confirm':
+                def_id = int(parts[2])
+                page = int(parts[3]) if len(parts) > 3 else 0
+                ok = self.db.deactivate_task_definition(user_id, def_id)
+                if ok:
+                    self.unschedule_task_definition(chat_id, def_id)
+                defs_after = self.db.list_task_definitions(user_id)
+                if not defs_after:
+                    await query.edit_message_text("🗑️ Задача удалена. Активных задач не осталось.")
+                    return
+                # Подготовим безопасную страницу (учитываем возможное сокращение списка)
+                total_pages = max(1, (len(defs_after) - 1) // 5 + 1)
+                safe_page = min(page, total_pages - 1)
+                await self.show_task_picker(chat_id, user_id, 'delete', page=safe_page, query=query)
+                return
+            # Если формат данных неизвестен, продолжаем другие ветки
         
         if data.startswith('quick_') or data.startswith('check_'):
             parts = data.split('_')
@@ -910,7 +999,7 @@ class TaskAssistantBot:
         user_id = user['id']
         args = context.args if hasattr(context, 'args') else []
         if not args:
-            await self.send_message_to_chat(chat_id, "Использование: /edittask <id>")
+            await self.show_task_picker(chat_id, user_id, action="edit", page=0)
             return
         try:
             def_id = int(args[0])
@@ -944,7 +1033,7 @@ class TaskAssistantBot:
         user_id = user['id']
         args = context.args if hasattr(context, 'args') else []
         if not args:
-            await self.send_message_to_chat(chat_id, "Использование: /deletetask <id>")
+            await self.show_task_picker(chat_id, user_id, action="delete", page=0)
             return
         try:
             def_id = int(args[0])
