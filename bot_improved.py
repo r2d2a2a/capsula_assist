@@ -1,15 +1,21 @@
 import logging
 import datetime
 from typing import Dict, List
+import os
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config import BOT_TOKEN, USER_ID, TIMEZONE, TASKS_SCHEDULE
+from config import BOT_TOKEN, DEFAULT_TIMEZONE, TASKS_SCHEDULE
 from database import TaskDatabase
 from utils import get_moscow_time, format_date, get_day_name, get_motivational_message, get_task_emoji
+
+# Этот файл — экспериментальная/legacy версия. Для прод-использования рекомендуется bot.py.
+# Чтобы запустить именно этот режим (single-owner), задайте OWNER_CHAT_ID в .env
+OWNER_CHAT_ID = int(os.getenv('OWNER_CHAT_ID', '0'))
+TIMEZONE = DEFAULT_TIMEZONE
 
 # Настройка логирования
 logging.basicConfig(
@@ -81,7 +87,7 @@ class ImprovedTaskAssistantBot:
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Улучшенная команда /start с лучшим UX"""
-        if update.effective_user.id != USER_ID:
+        if OWNER_CHAT_ID and update.effective_chat.id != OWNER_CHAT_ID:
             await update.message.reply_text("🔒 Этот бот предназначен только для определенного пользователя.")
             return
         
@@ -99,7 +105,7 @@ class ImprovedTaskAssistantBot:
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Улучшенная команда /help с группировкой"""
-        if update.effective_user.id != USER_ID:
+        if OWNER_CHAT_ID and update.effective_chat.id != OWNER_CHAT_ID:
             return
         
         help_text = """📚 **Доступные команды:**
@@ -305,7 +311,7 @@ class ImprovedTaskAssistantBot:
         query = update.callback_query
         await query.answer()
         
-        if update.effective_user.id != USER_ID:
+        if OWNER_CHAT_ID and update.effective_chat.id != OWNER_CHAT_ID:
             return
         
         data = query.data
@@ -359,7 +365,7 @@ class ImprovedTaskAssistantBot:
     
     async def today_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Улучшенная команда /today"""
-        if update.effective_user.id != USER_ID:
+        if OWNER_CHAT_ID and update.effective_chat.id != OWNER_CHAT_ID:
             return
         
         today = get_moscow_time()
@@ -393,7 +399,7 @@ class ImprovedTaskAssistantBot:
     
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Улучшенная команда /stats"""
-        if update.effective_user.id != USER_ID:
+        if OWNER_CHAT_ID and update.effective_chat.id != OWNER_CHAT_ID:
             return
         
         today = get_moscow_time().strftime('%Y-%m-%d')
@@ -416,7 +422,7 @@ class ImprovedTaskAssistantBot:
 
     async def comment_message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Сохранение пользовательского комментария к задаче"""
-        if update.effective_user.id != USER_ID:
+        if OWNER_CHAT_ID and update.effective_chat.id != OWNER_CHAT_ID:
             return
         awaiting = context.user_data.get('awaiting_comment')
         if not awaiting:
@@ -433,7 +439,7 @@ class ImprovedTaskAssistantBot:
     
     async def start_bot_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Улучшенная команда /start_bot"""
-        if update.effective_user.id != USER_ID:
+        if OWNER_CHAT_ID and update.effective_chat.id != OWNER_CHAT_ID:
             return
         
         if not self.scheduler.running:
@@ -450,7 +456,7 @@ class ImprovedTaskAssistantBot:
     
     async def stop_bot_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Улучшенная команда /stop_bot"""
-        if update.effective_user.id != USER_ID:
+        if OWNER_CHAT_ID and update.effective_chat.id != OWNER_CHAT_ID:
             return
         
         if self.scheduler.running:
@@ -475,9 +481,8 @@ async def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не установлен!")
         return
-    
-    if not USER_ID:
-        logger.error("USER_ID не установлен!")
+    if not OWNER_CHAT_ID:
+        logger.error("OWNER_CHAT_ID не установлен! Для этой legacy-версии задайте OWNER_CHAT_ID в .env, либо используйте bot.py")
         return
     
     # Создаем экземпляр улучшенного бота
@@ -490,7 +495,7 @@ async def main():
     async def send_message_to_user(message: str, reply_markup=None, parse_mode=None):
         try:
             await application.bot.send_message(
-                chat_id=USER_ID,
+                chat_id=OWNER_CHAT_ID,
                 text=message,
                 reply_markup=reply_markup,
                 parse_mode=parse_mode

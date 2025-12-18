@@ -13,7 +13,7 @@ pip install -r requirements.txt
 Создайте файл `.env`:
 ```
 BOT_TOKEN=ваш_токен_от_BotFather
-USER_ID=ваш_user_id
+DEFAULT_TIMEZONE=Europe/Moscow  # опционально
 ```
 
 ## 4. Тестирование

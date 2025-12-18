@@ -40,7 +40,7 @@ if [ ! -f "$PROJECT_DIR/.env" ]; then
     echo "⚠️  Файл .env не найден в $PROJECT_DIR"
     echo "📝 Создайте файл .env со следующим содержимым:"
     echo "BOT_TOKEN=your_telegram_bot_token_here"
-    echo "USER_ID=your_telegram_user_id_here"
+    echo "DEFAULT_TIMEZONE=Europe/Moscow  # опционально"
     echo ""
     read -p "Продолжить установку? (y/N): " -n 1 -r
     echo

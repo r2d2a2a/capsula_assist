@@ -15,7 +15,7 @@ def test_environment():
     env_file = Path('.env')
     if not env_file.exists():
         print("❌ Файл .env не найден!")
-        print("📝 Создайте файл .env с токеном бота и User ID")
+        print("📝 Создайте файл .env с токеном бота")
         return False
     
     # Загружаем переменные
@@ -31,21 +31,6 @@ def test_environment():
     bot_token = os.getenv('BOT_TOKEN')
     if not bot_token or bot_token == 'your_telegram_bot_token_here':
         print("❌ BOT_TOKEN не установлен или имеет значение по умолчанию!")
-        return False
-    
-    # Проверяем User ID
-    user_id = os.getenv('USER_ID')
-    if not user_id or user_id == 'your_telegram_user_id_here':
-        print("❌ USER_ID не установлен или имеет значение по умолчанию!")
-        return False
-    
-    try:
-        user_id_int = int(user_id)
-        if user_id_int <= 0:
-            print("❌ USER_ID должен быть положительным числом!")
-            return False
-    except ValueError:
-        print("❌ USER_ID должен быть числом!")
         return False
     
     print("✅ Переменные окружения настроены корректно")
@@ -78,9 +63,8 @@ def test_config():
     print("\n🔍 Проверка конфигурации...")
     
     try:
-        from config import TASKS_SCHEDULE, TIMEZONE
-        
-        print(f"✅ Часовой пояс: {TIMEZONE}")
+        from config import TASKS_SCHEDULE, DEFAULT_TIMEZONE
+        print(f"✅ Часовой пояс по умолчанию: {DEFAULT_TIMEZONE}")
         print(f"✅ Настроено задач: {len(TASKS_SCHEDULE)}")
         
         for task_name, task_config in TASKS_SCHEDULE.items():

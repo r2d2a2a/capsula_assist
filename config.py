@@ -5,10 +5,9 @@ load_dotenv()
 
 # Конфигурация бота
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-USER_ID = int(os.getenv('USER_ID', 0))
 
-# Настройки времени (МСК)
-TIMEZONE = 'Europe/Moscow'
+# Часовой пояс по умолчанию (для новых пользователей и обратной совместимости)
+DEFAULT_TIMEZONE = os.getenv('DEFAULT_TIMEZONE', 'Europe/Moscow')
 
 # Расписание задач
 TASKS_SCHEDULE = {

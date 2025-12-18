@@ -1,13 +1,13 @@
 import logging
 import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config import BOT_TOKEN, USER_ID, TIMEZONE, TASKS_SCHEDULE
+from config import BOT_TOKEN, DEFAULT_TIMEZONE, TASKS_SCHEDULE
 from database import TaskDatabase
 import utils
 
@@ -27,12 +27,79 @@ for noisy_logger in ["httpx", "httpcore"]:
 class TaskAssistantBot:
     def __init__(self):
         self.db = TaskDatabase()
-        # Принудительно используем московский часовой пояс
-        self.moscow_tz = pytz.timezone('Europe/Moscow')
-        self.scheduler = AsyncIOScheduler(timezone=self.moscow_tz)
+        # Планировщик держим в UTC, а timezone задаем на уровне CronTrigger для каждого пользователя.
+        self.scheduler = AsyncIOScheduler(timezone=pytz.UTC)
         self.add_task_state: Dict[int, Dict] = {}
         self.edit_task_state: Dict[int, Dict] = {}
         self.setup_scheduler()
+
+    def _tzinfo_from_string(self, tz_str: str):
+        """Преобразовать строку timezone в tzinfo.
+
+        Поддерживаем:
+        - IANA timezone (например, Europe/Moscow)
+        - фиксированный оффсет: offset:+180 (минуты)
+        """
+        tz_str = (tz_str or '').strip()
+        if tz_str.startswith('offset:'):
+            try:
+                minutes = int(tz_str.split(':', 1)[1])
+                return pytz.FixedOffset(minutes)
+            except Exception:
+                return pytz.timezone(DEFAULT_TIMEZONE)
+        try:
+            return pytz.timezone(tz_str or DEFAULT_TIMEZONE)
+        except Exception:
+            return pytz.timezone(DEFAULT_TIMEZONE)
+
+    def _format_timezone(self, tz_str: str) -> str:
+        tz_str = (tz_str or '').strip()
+        if tz_str.startswith('offset:'):
+            try:
+                minutes = int(tz_str.split(':', 1)[1])
+                sign = '+' if minutes >= 0 else '-'
+                minutes_abs = abs(minutes)
+                hh = minutes_abs // 60
+                mm = minutes_abs % 60
+                return f"UTC{sign}{hh:02d}:{mm:02d}"
+            except Exception:
+                return DEFAULT_TIMEZONE
+        return tz_str or DEFAULT_TIMEZONE
+
+    def _parse_timezone_input(self, text: str) -> Optional[str]:
+        """Распарсить ввод пользователя в timezone-строку для хранения.
+
+        Принимаем:
+        - IANA timezone: Europe/Moscow, America/New_York
+        - UTC / UTC+3 / UTC+03:00 / +3 / -5 / +03:30
+        """
+        raw = (text or '').strip()
+        if not raw:
+            return None
+        upper = raw.upper()
+        if upper == 'UTC':
+            return 'offset:0'
+
+        # Нормализуем ввод типа "+3", "UTC+3", "UTC+03:00"
+        import re
+        m = re.fullmatch(r'(?:UTC)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?\s*', upper)
+        if m:
+            sign, hh_s, mm_s = m.group(1), m.group(2), m.group(3)
+            hh = int(hh_s)
+            mm = int(mm_s) if mm_s is not None else 0
+            if hh > 14 or mm >= 60:
+                return None
+            total = hh * 60 + mm
+            if sign == '-':
+                total = -total
+            return f'offset:{total}'
+
+        # Пробуем IANA timezone
+        try:
+            _ = pytz.timezone(raw)
+            return raw
+        except Exception:
+            return None
     
     def setup_scheduler(self):
         """Базовая инициализация планировщика (планирования добавляются по пользователям)."""
@@ -45,24 +112,26 @@ class TaskAssistantBot:
             logger.info(f"Job {job.id} next run: {next_run}")
 
     def schedule_reports_for_user(self, chat_id: int, user_id: int):
+        tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
         daily_id = f'daily_report_{chat_id}'
         weekly_id = f'weekly_report_{chat_id}'
         self.scheduler.add_job(
             self.send_daily_report_v2,
-            CronTrigger(hour=20, minute=0, timezone=self.moscow_tz),
+            CronTrigger(hour=20, minute=0, timezone=tz),
             args=[chat_id, user_id],
             id=daily_id,
             replace_existing=True
         )
         self.scheduler.add_job(
             self.send_weekly_report_v2,
-            CronTrigger(day_of_week=6, hour=20, minute=30, timezone=self.moscow_tz),
+            CronTrigger(day_of_week=6, hour=20, minute=30, timezone=tz),
             args=[chat_id, user_id],
             id=weekly_id,
             replace_existing=True
         )
 
     def schedule_task_definition(self, chat_id: int, user_id: int, task_def: Dict):
+        tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
         days: List[int] = task_def.get('days_list') or list(range(7))
         rh, rm = map(int, task_def['reminder_time'].split(':'))
         ch, cm = map(int, task_def['check_time'].split(':'))
@@ -73,14 +142,14 @@ class TaskAssistantBot:
             c_job_id = f'v2_check_{chat_id}_{def_id}_{day}_{ch:02d}{cm:02d}'
             self.scheduler.add_job(
                 self.send_task_reminder_v2,
-                CronTrigger(day_of_week=day, hour=rh, minute=rm, timezone=self.moscow_tz),
+                CronTrigger(day_of_week=day, hour=rh, minute=rm, timezone=tz),
                 args=[chat_id, user_id, def_id, name],
                 id=r_job_id,
                 replace_existing=True
             )
             self.scheduler.add_job(
                 self.send_completion_check_v2,
-                CronTrigger(day_of_week=day, hour=ch, minute=cm, timezone=self.moscow_tz),
+                CronTrigger(day_of_week=day, hour=ch, minute=cm, timezone=tz),
                 args=[chat_id, user_id, def_id, name],
                 id=c_job_id,
                 replace_existing=True
@@ -110,6 +179,7 @@ class TaskAssistantBot:
         chat_id = update.effective_chat.id
         username = update.effective_user.username
         user_id = self.db.upsert_user(chat_id, username)
+        tz_str = self.db.get_user_timezone(user_id)
         self.schedule_all_for_user(chat_id, user_id)
         
         welcome_text = """
@@ -124,7 +194,11 @@ class TaskAssistantBot:
 Используйте /help для получения списка команд.
         """
         await update.message.reply_text(welcome_text)
-        await update.message.reply_text("Добавьте свою задачу командой /addtask. Посмотреть список: /mytasks")
+        await update.message.reply_text(
+            f"Ваш часовой пояс сейчас: {self._format_timezone(tz_str)}\n"
+            "Если вы не в МСК — задайте свой часовой пояс командой /timezone.\n\n"
+            "Добавьте свою задачу командой /addtask. Посмотреть список: /mytasks"
+        )
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /help"""
@@ -139,6 +213,7 @@ class TaskAssistantBot:
 /today - Показать задачи на сегодня
 /stats - Показать статистику за сегодня
 /report - Получить отчет за сегодня
+ /timezone - Установить часовой пояс
  /edittask - Редактировать задачу (список с кнопками)
  /deletetask - Удалить задачу (список с кнопками)
  
@@ -147,18 +222,47 @@ class TaskAssistantBot:
 /stop_bot - Остановить напоминания
         """
         await update.message.reply_text(help_text)
+
+    async def timezone_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /timezone — установка TZ пользователя."""
+        chat_id = update.effective_chat.id
+        user = self.db.get_user_by_chat_id(chat_id)
+        if not user:
+            user_id = self.db.upsert_user(chat_id, update.effective_user.username)
+        else:
+            user_id = user['id']
+        tz_str = self.db.get_user_timezone(user_id)
+
+        keyboard = [
+            [InlineKeyboardButton("Europe/Moscow", callback_data="tz_set_Europe/Moscow")],
+            [InlineKeyboardButton("Europe/Berlin", callback_data="tz_set_Europe/Berlin")],
+            [InlineKeyboardButton("America/New_York", callback_data="tz_set_America/New_York")],
+            [InlineKeyboardButton("Asia/Dubai", callback_data="tz_set_Asia/Dubai")],
+            [InlineKeyboardButton("UTC+03:00", callback_data="tz_set_offset:+180"),
+             InlineKeyboardButton("UTC+05:00", callback_data="tz_set_offset:+300")],
+            [InlineKeyboardButton("Ввести вручную", callback_data="tz_manual")],
+        ]
+        context.user_data['awaiting_timezone'] = True
+        await update.message.reply_text(
+            f"Текущий часовой пояс: {self._format_timezone(tz_str)}\n\n"
+            "Выберите вариант кнопкой или отправьте сообщением, например:\n"
+            "- Europe/Paris\n"
+            "- America/Los_Angeles\n"
+            "- UTC+03:00 или +3\n",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     
     async def send_task_reminder(self, task_type: str, task_name: str):
         """Отправить напоминание о задаче"""
         try:
-            today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
+            today = datetime.datetime.now(pytz.timezone(DEFAULT_TIMEZONE)).strftime('%Y-%m-%d')
             # Атомарно получаем право на отправку, чтобы избежать дублей
             lock_acquired, _ = self.db.acquire_send_lock(task_type, today)
             if not lock_acquired:
                 logger.info(f"Пропускаем дубликат напоминания для {task_type} на {today}")
                 return
             # Отправляем напоминание
-            message = f"⏰ Напоминание!\n\n📋 Время для: {task_name}\n🕐 {datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%H:%M')}"
+            message = f"⏰ Напоминание!\n\n📋 Время для: {task_name}\n🕐 {datetime.datetime.now(pytz.timezone(DEFAULT_TIMEZONE)).strftime('%H:%M')}"
             # Напоминание отправляем без кнопок. Кнопки показываются только при контроле выполнения.
             await self.send_message_to_user(message, reply_markup=None)
             
@@ -170,11 +274,13 @@ class TaskAssistantBot:
     async def send_task_reminder_v2(self, chat_id: int, user_id: int, task_def_id: int, task_name: str):
         """Многопользовательское напоминание."""
         try:
-            today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
+            tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+            now = datetime.datetime.now(tz)
+            today = now.strftime('%Y-%m-%d')
             lock_acquired, _ = self.db.acquire_send_lock_v2(user_id, task_def_id, today)
             if not lock_acquired:
                 return
-            message = f"⏰ Напоминание!\n\n📋 Время для: {task_name}\n🕐 {datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%H:%M')}"
+            message = f"⏰ Напоминание!\n\n📋 Время для: {task_name}\n🕐 {now.strftime('%H:%M')}"
             # Напоминание отправляем без кнопок. Кнопки показываются только при контроле выполнения.
             await self.send_message_to_chat(chat_id, message, reply_markup=None)
         except Exception as e:
@@ -183,7 +289,7 @@ class TaskAssistantBot:
     async def send_completion_check(self, task_type: str, task_name: str):
         """Отправить проверку выполнения задачи"""
         try:
-            today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
+            today = datetime.datetime.now(pytz.timezone(DEFAULT_TIMEZONE)).strftime('%Y-%m-%d')
             
             # Атомарно получаем право на отправку проверки, чтобы избежать дублей
             lock_acquired, _ = self.db.acquire_check_lock(task_type, today)
@@ -191,7 +297,7 @@ class TaskAssistantBot:
                 logger.info(f"Пропускаем дубликат проверки для {task_type} на {today}")
                 return
             
-            message = f"🔍 Контроль выполнения!\n\n📋 Задача: {task_name}\n⏰ Время проверки: {datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%H:%M')}\n\nВыполнили ли вы эту задачу?"
+            message = f"🔍 Контроль выполнения!\n\n📋 Задача: {task_name}\n⏰ Время проверки: {datetime.datetime.now(pytz.timezone(DEFAULT_TIMEZONE)).strftime('%H:%M')}\n\nВыполнили ли вы эту задачу?"
             
             keyboard = [
                 [InlineKeyboardButton("✅ Да, выполнил", callback_data=f"check_yes_{task_type}_{today}")],
@@ -206,11 +312,13 @@ class TaskAssistantBot:
     
     async def send_completion_check_v2(self, chat_id: int, user_id: int, task_def_id: int, task_name: str):
         try:
-            today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
+            tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+            now = datetime.datetime.now(tz)
+            today = now.strftime('%Y-%m-%d')
             lock_acquired, _ = self.db.acquire_check_lock_v2(user_id, task_def_id, today)
             if not lock_acquired:
                 return
-            message = f"🔍 Контроль выполнения!\n\n📋 Задача: {task_name}\n⏰ Время проверки: {datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%H:%M')}\n\nВыполнили ли вы эту задачу?"
+            message = f"🔍 Контроль выполнения!\n\n📋 Задача: {task_name}\n⏰ Время проверки: {now.strftime('%H:%M')}\n\nВыполнили ли вы эту задачу?"
             keyboard = [
                 [InlineKeyboardButton("✅ Да, выполнил", callback_data=f"v2_check_yes_{task_def_id}_{today}")],
                 [InlineKeyboardButton("❌ Нет, не выполнил", callback_data=f"v2_check_no_{task_def_id}_{today}")]
@@ -222,7 +330,7 @@ class TaskAssistantBot:
     async def send_daily_report(self):
         """Отправить ежедневный отчет"""
         try:
-            today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
+            today = datetime.datetime.now(pytz.timezone(DEFAULT_TIMEZONE)).strftime('%Y-%m-%d')
             stats = self.db.get_completion_stats(today, today)
             tasks = self.db.get_tasks_for_date(today)
             
@@ -249,7 +357,8 @@ class TaskAssistantBot:
     
     async def send_daily_report_v2(self, chat_id: int, user_id: int):
         try:
-            today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
+            tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+            today = datetime.datetime.now(tz).strftime('%Y-%m-%d')
             stats = self.db.get_completion_stats_by_user(user_id, today, today)
             tasks = self.db.get_tasks_for_date_by_user(user_id, today)
             defs = {d['id']: d for d in self.db.list_task_definitions(user_id)}
@@ -273,7 +382,7 @@ class TaskAssistantBot:
     async def send_weekly_report(self):
         """Отправить еженедельный отчет"""
         try:
-            today = datetime.datetime.now(pytz.timezone(TIMEZONE))
+            today = datetime.datetime.now(pytz.timezone(DEFAULT_TIMEZONE))
             week_start = (today - datetime.timedelta(days=today.weekday())).strftime('%Y-%m-%d')
             week_end = today.strftime('%Y-%m-%d')
             
@@ -320,7 +429,8 @@ class TaskAssistantBot:
     
     async def send_weekly_report_v2(self, chat_id: int, user_id: int):
         try:
-            today = datetime.datetime.now(pytz.timezone(TIMEZONE))
+            tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+            today = datetime.datetime.now(tz)
             week_start = (today - datetime.timedelta(days=today.weekday())).strftime('%Y-%m-%d')
             week_end = today.strftime('%Y-%m-%d')
             stats = self.db.get_completion_stats_by_user(user_id, week_start, week_end)
@@ -455,6 +565,45 @@ class TaskAssistantBot:
         await query.answer()
         
         data = query.data
+
+        # ----- Timezone setup -----
+        if data.startswith('tz_set_'):
+            chat_id = update.effective_chat.id
+            user = self.db.get_user_by_chat_id(chat_id)
+            if not user:
+                user_id = self.db.upsert_user(chat_id, update.effective_user.username)
+            else:
+                user_id = user['id']
+            tz_value = data[len('tz_set_'):]
+
+            # Поддерживаем tz_set_offset:+180 и tz_set_Europe/Moscow
+            parsed = tz_value
+
+            # Валидация
+            if parsed.startswith('offset:'):
+                try:
+                    _ = int(parsed.split(':', 1)[1])
+                except Exception:
+                    await query.edit_message_text("Не удалось распознать оффсет.")
+                    return
+            else:
+                try:
+                    _ = pytz.timezone(parsed)
+                except Exception:
+                    await query.edit_message_text("Не удалось распознать timezone.")
+                    return
+
+            self.db.set_user_timezone(user_id, parsed)
+            self.unschedule_all_for_chat(chat_id)
+            self.schedule_all_for_user(chat_id, user_id)
+            context.user_data.pop('awaiting_timezone', None)
+            await query.edit_message_text(f"✅ Часовой пояс сохранен: {self._format_timezone(parsed)}. Расписание обновлено.")
+            return
+
+        if data == 'tz_manual':
+            context.user_data['awaiting_timezone'] = True
+            await query.edit_message_text("Ок. Отправьте часовой пояс сообщением (например, Europe/Paris или UTC+03:00 / +3).")
+            return
 
         # ----- Пагинация списков задач для редактирования/удаления -----
         if data.startswith(('editlist_', 'dellist_')):
@@ -791,6 +940,25 @@ class TaskAssistantBot:
         """Обработка текстовых сообщений: комментарии и мастер добавления задач"""
         text = (update.message.text or '').strip()
         chat_id = update.effective_chat.id
+
+        # -1) Установка timezone
+        if context.user_data.get('awaiting_timezone'):
+            parsed = self._parse_timezone_input(text)
+            if not parsed:
+                await update.message.reply_text("Не понял часовой пояс. Пример: Europe/Paris или UTC+03:00 (или +3).")
+                return
+            user = self.db.get_user_by_chat_id(chat_id)
+            if not user:
+                user_id = self.db.upsert_user(chat_id, update.effective_user.username)
+            else:
+                user_id = user['id']
+            self.db.set_user_timezone(user_id, parsed)
+            # Перепланируем
+            self.unschedule_all_for_chat(chat_id)
+            self.schedule_all_for_user(chat_id, user_id)
+            context.user_data.pop('awaiting_timezone', None)
+            await update.message.reply_text(f"✅ Часовой пояс сохранен: {self._format_timezone(parsed)}. Расписание обновлено.")
+            return
         
         # 0) Редактирование задач: обработка полей
         st_edit = self.edit_task_state.get(chat_id)
@@ -902,16 +1070,16 @@ class TaskAssistantBot:
     
     async def today_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /today"""
-        tz = pytz.timezone(TIMEZONE)
-        now = datetime.datetime.now(tz)
-        today_str = now.strftime('%Y-%m-%d')
-        weekday = now.weekday()
         chat_id = update.effective_chat.id
         user = self.db.get_user_by_chat_id(chat_id)
         if not user:
             await self.send_message_to_chat(chat_id, "Начните с /start")
             return
         user_id = user['id']
+        tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+        now = datetime.datetime.now(tz)
+        today_str = now.strftime('%Y-%m-%d')
+        weekday = now.weekday()
         defs = self.db.list_task_definitions(user_id)
         tasks_in_db = {t.get('task_def_id'): t for t in self.db.get_tasks_for_date_by_user(user_id, today_str)}
         scheduled_today = []
@@ -944,7 +1112,8 @@ class TaskAssistantBot:
             await update.message.reply_text("Начните с /start")
             return
         user_id = user['id']
-        today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
+        tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+        today = datetime.datetime.now(tz).strftime('%Y-%m-%d')
         stats = self.db.get_completion_stats_by_user(user_id, today, today)
         message = f"📊 Статистика на сегодня:\n\n"
         message += f"• Всего задач: {stats['total_tasks']}\n"
@@ -964,7 +1133,8 @@ class TaskAssistantBot:
         except Exception as e:
             logger.error(f"/report: ошибка при формировании отчета: {e}")
             try:
-                today = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')
+                tz = self._tzinfo_from_string(self.db.get_user_timezone(user['id']))
+                today = datetime.datetime.now(tz).strftime('%Y-%m-%d')
                 stats = self.db.get_completion_stats_by_user(user['id'], today, today)
                 msg = (
                     "📊 Отчет за сегодня (упрощенный):\n\n"
@@ -1139,10 +1309,6 @@ async def main():
         logger.error("BOT_TOKEN не установлен!")
         return
     
-    if not USER_ID:
-        logger.error("USER_ID не установлен!")
-        return
-    
     # Создаем экземпляр бота
     bot_instance = TaskAssistantBot()
     
@@ -1159,22 +1325,10 @@ async def main():
             BotCommand("edittask", "Редактировать задачу"),
             BotCommand("deletetask", "Удалить задачу"),
             BotCommand("report", "Отчет за сегодня"),
+            BotCommand("timezone", "Часовой пояс"),
         ])
     except Exception as e:
         logger.error(f"Не удалось установить команды бота: {e}")
-    
-    # Переопределяем метод отправки сообщений
-    async def send_message_to_user(message: str, reply_markup=None):
-        try:
-            await application.bot.send_message(
-                chat_id=USER_ID,
-                text=message,
-                reply_markup=reply_markup
-            )
-        except Exception as e:
-            logger.error(f"Ошибка при отправке сообщения: {e}")
-    
-    bot_instance.send_message_to_user = send_message_to_user
     
     async def send_message_to_chat(chat_id: int, message: str, reply_markup=None):
         try:
@@ -1211,6 +1365,7 @@ async def main():
     application.add_handler(CommandHandler("mytasks", bot_instance.mytasks_command))
     application.add_handler(CommandHandler("edittask", bot_instance.edittask_command))
     application.add_handler(CommandHandler("deletetask", bot_instance.deletetask_command))
+    application.add_handler(CommandHandler("timezone", bot_instance.timezone_command))
     
     # Добавляем обработчик кнопок
     application.add_handler(CallbackQueryHandler(bot_instance.button_callback))

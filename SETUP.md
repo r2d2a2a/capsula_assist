@@ -28,13 +28,13 @@ pip install -r requirements.txt
 
 ```
 BOT_TOKEN=ваш_токен_от_BotFather
-USER_ID=ваш_user_id
+DEFAULT_TIMEZONE=Europe/Moscow  # опционально
 ```
 
 **Пример:**
 ```
 BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
-USER_ID=123456789
+DEFAULT_TIMEZONE=Europe/Moscow
 ```
 
 ## Шаг 5: Запуск бота
@@ -144,6 +144,10 @@ chmod +x run.py
 - **Никогда не делитесь** вашим BOT_TOKEN
 - **Не публикуйте** файл `.env` в публичных репозиториях
 - Регулярно проверяйте логи на предмет подозрительной активности
+
+## Часовой пояс
+
+После запуска откройте чат с ботом и установите свой часовой пояс командой `/timezone`.
 
 ## Поддержка
 

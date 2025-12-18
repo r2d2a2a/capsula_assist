@@ -22,9 +22,24 @@ class TaskDatabase:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER UNIQUE NOT NULL,
                 username TEXT,
+                timezone TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Миграция: добавить timezone в users, если старая таблица без этого столбца
+        cursor.execute("PRAGMA table_info(users)")
+        user_columns = [row[1] for row in cursor.fetchall()]
+        if 'timezone' not in user_columns:
+            try:
+                cursor.execute("ALTER TABLE users ADD COLUMN timezone TEXT")
+                conn.commit()
+            except sqlite3.OperationalError as e:
+                logger.error(f"Не удалось добавить колонку timezone в таблицу users: {e}")
+        # Обратная совместимость: если timezone не задан — считаем Europe/Moscow
+        try:
+            cursor.execute("UPDATE users SET timezone = 'Europe/Moscow' WHERE timezone IS NULL OR timezone = ''")
+        except sqlite3.OperationalError:
+            pass
 
         # Таблица определений задач (шаблоны задач пользователей)
         cursor.execute('''
@@ -238,7 +253,7 @@ class TaskDatabase:
             conn.commit()
             conn.close()
             return user_id
-        cursor.execute('INSERT INTO users (chat_id, username) VALUES (?, ?)', (chat_id, username))
+        cursor.execute('INSERT INTO users (chat_id, username, timezone) VALUES (?, ?, ?)', (chat_id, username, 'Europe/Moscow'))
         user_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -255,6 +270,26 @@ class TaskDatabase:
         columns = [d[0] for d in cursor.description]
         conn.close()
         return dict(zip(columns, row))
+
+    def get_user_timezone(self, user_id: int) -> str:
+        """Вернуть timezone пользователя (строкой). По умолчанию Europe/Moscow."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT timezone FROM users WHERE id = ?', (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        tz = (row[0] if row else None) or 'Europe/Moscow'
+        return tz
+
+    def set_user_timezone(self, user_id: int, timezone: str) -> bool:
+        """Сохранить timezone пользователя. Возвращает True, если обновлена >=1 строка."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET timezone = ? WHERE id = ?', (timezone, user_id))
+        updated = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return updated > 0
 
     def list_users(self) -> List[Dict]:
         conn = sqlite3.connect(self.db_path)

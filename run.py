@@ -18,8 +18,8 @@ def check_env_file():
         print("❌ Файл .env не найден!")
         print("📝 Создайте файл .env со следующим содержимым:")
         print("BOT_TOKEN=your_telegram_bot_token_here")
-        print("USER_ID=your_telegram_user_id_here")
-        print("\n🔧 Инструкции по получению токена и ID см. в README.md")
+        print("DEFAULT_TIMEZONE=Europe/Moscow  # опционально")
+        print("\n🔧 Инструкции по получению токена см. в README.md")
         return False
     return True
 
