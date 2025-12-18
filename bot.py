@@ -32,6 +32,7 @@ class TaskAssistantBot:
         self.scheduler = AsyncIOScheduler(timezone=pytz.UTC)
         self.add_task_state: Dict[int, Dict] = {}
         self.edit_task_state: Dict[int, Dict] = {}
+        self.daily_plan_state: Dict[int, Dict] = {}
         self.setup_scheduler()
 
     def _tzinfo_from_string(self, tz_str: str):
@@ -367,6 +368,8 @@ class TaskAssistantBot:
 
 /start - Начать работу с ботом
 /help - Показать это сообщение
+/plan - Ежедневное планирование (3 приоритета/деньги/продукт)
+/dailyplan - То же самое, алиас
 /addtask - Добавить задачу (до 10)
 /cancel - Отменить добавление задачи
 /mytasks - Список моих задач
@@ -382,6 +385,59 @@ class TaskAssistantBot:
 /stop_bot - Остановить напоминания
         """
         await update.message.reply_text(help_text)
+
+    def _format_daily_plan_text(self, date_str: str, plan: Optional[Dict]) -> str:
+        if not plan:
+            return f"🗓️ Ежедневное планирование — {date_str}\n\nПлана на сегодня пока нет."
+        priorities = plan.get('priorities') or []
+        lines = [f"🗓️ Ежедневное планирование — {date_str}", ""]
+        lines.append("🎯 3 приоритета дня:")
+        if priorities:
+            for i in range(3):
+                val = priorities[i] if i < len(priorities) else ""
+                lines.append(f"{i+1}) {val or '—'}")
+        else:
+            lines.append("—")
+        lines.append("")
+        lines.append(f"💰 Денежное действие: {plan.get('money_action') or '—'}")
+        lines.append(f"🧩 Действие по продукту: {plan.get('product_action') or '—'}")
+        return "\n".join(lines)
+
+    async def dailyplan_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сценарий: Ежедневное планирование (3 приоритета, 1 денежное действие, 1 действие по продукту)."""
+        chat_id = update.effective_chat.id
+        user = self.db.get_user_by_chat_id(chat_id)
+        if not user:
+            await update.message.reply_text("Начните с /start")
+            return
+        user_id = user['id']
+        tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+        today = datetime.datetime.now(tz).strftime('%Y-%m-%d')
+        plan = self.db.get_daily_plan(user_id, today)
+        text = self._format_daily_plan_text(today, plan)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✍️ Заполнить/обновить", callback_data="dailyplan_start")],
+            [InlineKeyboardButton("Закрыть", callback_data="dailyplan_close")]
+        ])
+        await self.send_message_to_chat(chat_id, text, kb)
+
+    async def plan_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Алиас для /dailyplan."""
+        await self.dailyplan_command(update, context)
+
+    async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отменить активные сценарии (addtask/edittask/plan/timezone)."""
+        chat_id = update.effective_chat.id
+        self.add_task_state.pop(chat_id, None)
+        self.edit_task_state.pop(chat_id, None)
+        self.daily_plan_state.pop(chat_id, None)
+        try:
+            context.user_data.pop('awaiting_timezone', None)
+            context.user_data.pop('awaiting_comment', None)
+            context.user_data.pop('awaiting_comment_v2', None)
+        except Exception:
+            pass
+        await update.message.reply_text("❌ Отменено.")
 
     async def timezone_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /timezone — установка TZ пользователя."""
@@ -529,18 +585,42 @@ class TaskAssistantBot:
             stats = self.db.get_completion_stats_by_user(user_id, today, today)
             tasks = self.db.get_tasks_for_date_by_user(user_id, today)
             defs = {d['id']: d for d in self.db.list_task_definitions(user_id)}
+            plan = self.db.get_daily_plan(user_id, today)
             report = f"📊 Ежедневный отчет - {today}\n\n"
+            if plan:
+                report += "🗓️ План дня:\n"
+                priorities = plan.get('priorities') or []
+                if priorities:
+                    for i in range(3):
+                        val = priorities[i] if i < len(priorities) else ""
+                        report += f"• Приоритет {i+1}: {val or '—'}\n"
+                else:
+                    report += "• Приоритеты: —\n"
+                report += f"• Денежное действие: {plan.get('money_action') or '—'}\n"
+                report += f"• Действие по продукту: {plan.get('product_action') or '—'}\n\n"
             report += f"📈 Общая статистика:\n"
             report += f"• Всего задач: {stats['total_tasks']}\n"
             report += f"• Выполнено: {stats['completed_tasks']}\n"
             report += f"• Процент выполнения: {stats['completion_rate']}%\n\n"
-            report += "📋 Детали по задачам:\n"
+            report += "📋 Детали по задачам (по проектам):\n"
+            grouped: Dict[str, List[Dict]] = {}
             for task in tasks:
-                status = "✅" if task.get('completed') else "❌"
-                name = defs.get(task.get('task_def_id'), {}).get('name', f"#{task.get('task_def_id')}")
-                report += f"• {name}: {status}\n"
-                if task.get('comment'):
-                    report += f"   📝 {task['comment']}\n"
+                d = defs.get(task.get('task_def_id'), {}) or {}
+                project = (d.get('project') or '').strip() or "Без проекта"
+                grouped.setdefault(project, []).append(task)
+            for project in sorted(grouped.keys()):
+                report += f"\n🏷️ {project}:\n"
+                for task in grouped[project]:
+                    status = "✅" if task.get('completed') else "❌"
+                    d = defs.get(task.get('task_def_id'), {}) or {}
+                    name = d.get('name', f"#{task.get('task_def_id')}")
+                    goal = (d.get('goal') or '').strip()
+                    goal_part = f" (цель: {goal})" if goal else ""
+                    tags_list = d.get('tags_list') or []
+                    tags_part = (" " + " ".join([f"#{t}" for t in tags_list])) if tags_list else ""
+                    report += f"• {name}{goal_part}{tags_part}: {status}\n"
+                    if task.get('comment'):
+                        report += f"   📝 {task['comment']}\n"
             self.db.save_report('daily', today, today, stats, user_id)
             await self.send_message_to_chat(chat_id, report)
         except Exception as e:
@@ -603,12 +683,30 @@ class TaskAssistantBot:
             stats = self.db.get_completion_stats_by_user(user_id, week_start, week_end)
             tasks = self.db.get_tasks_for_period_by_user(user_id, week_start, week_end)
             defs = {d['id']: d for d in self.db.list_task_definitions(user_id)}
+            plans = self.db.get_daily_plans_for_period(user_id, week_start, week_end)
             report = f"📊 Еженедельный отчет\n"
             report += f"📅 Период: {week_start} - {week_end}\n\n"
             report += f"📈 Общая статистика:\n"
             report += f"• Всего задач: {stats['total_tasks']}\n"
             report += f"• Выполнено: {stats['completed_tasks']}\n"
             report += f"• Процент выполнения: {stats['completion_rate']}%\n\n"
+            if plans:
+                report += "🗓️ Ежедневное планирование (сводка):\n"
+                for p in plans:
+                    date_str = p.get('date')
+                    money = (p.get('money_action') or '').strip()
+                    product = (p.get('product_action') or '').strip()
+                    priorities = p.get('priorities') or []
+                    pr_short = "; ".join([x for x in priorities if x]) if priorities else ""
+                    details = []
+                    if money:
+                        details.append(f"💰 {money}")
+                    if product:
+                        details.append(f"🧩 {product}")
+                    if pr_short:
+                        details.append(f"🎯 {pr_short}")
+                    report += f"• {date_str}: " + (" | ".join(details) if details else "—") + "\n"
+                report += "\n"
             daily_stats = {}
             for task in tasks:
                 date = task['date']
@@ -626,8 +724,20 @@ class TaskAssistantBot:
             if comments:
                 report += "\n📝 Комментарии:\n"
                 for t in comments:
-                    name = defs.get(t.get('task_def_id'), {}).get('name', f"#{t.get('task_def_id')}")
-                    report += f"• {t['date']} {name}: {t['comment']}\n"
+                    d = defs.get(t.get('task_def_id'), {}) or {}
+                    name = d.get('name', f"#{t.get('task_def_id')}")
+                    project = (d.get('project') or '').strip()
+                    goal = (d.get('goal') or '').strip()
+                    tags_list = d.get('tags_list') or []
+                    ctx = []
+                    if project:
+                        ctx.append(project)
+                    if goal:
+                        ctx.append(f"цель: {goal}")
+                    if tags_list:
+                        ctx.append("теги: " + " ".join([f"#{x}" for x in tags_list]))
+                    ctx_part = f" [{'; '.join(ctx)}]" if ctx else ""
+                    report += f"• {t['date']} {name}{ctx_part}: {t['comment']}\n"
             self.db.save_report('weekly', week_start, week_end, stats, user_id)
             await self.send_message_to_chat(chat_id, report)
         except Exception as e:
@@ -679,6 +789,8 @@ class TaskAssistantBot:
         """Клавиатура панели редактирования с кнопкой Сохранить."""
         kb = [
             [InlineKeyboardButton("Название", callback_data="edittask_field_name"), InlineKeyboardButton("Периодичность", callback_data="edittask_field_freq")],
+            [InlineKeyboardButton("Проект/контекст", callback_data="edittask_field_project"), InlineKeyboardButton("Цель", callback_data="edittask_field_goal")],
+            [InlineKeyboardButton("Теги", callback_data="edittask_field_tags")],
             [InlineKeyboardButton("Дни", callback_data="edittask_field_days"), InlineKeyboardButton("Дата (одноразовая)", callback_data="edittask_field_date")],
             [InlineKeyboardButton("Время напоминания", callback_data="edittask_field_reminder")],
             [InlineKeyboardButton("Время контроля", callback_data="edittask_field_check")],
@@ -732,6 +844,72 @@ class TaskAssistantBot:
         await query.answer()
         
         data = query.data
+
+        # ----- Daily planning -----
+        if data == "dailyplan_close":
+            await query.edit_message_text("Ок.")
+            return
+        if data == "dailyplan_cancel":
+            chat_id = update.effective_chat.id
+            self.daily_plan_state.pop(chat_id, None)
+            await query.edit_message_text("❌ Ежедневное планирование отменено.")
+            return
+        if data == "dailyplan_start":
+            chat_id = update.effective_chat.id
+            user = self.db.get_user_by_chat_id(chat_id)
+            if not user:
+                await query.edit_message_text("Начните с /start")
+                return
+            user_id = user['id']
+            tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
+            today = datetime.datetime.now(tz).strftime('%Y-%m-%d')
+            self.daily_plan_state[chat_id] = {
+                "user_id": user_id,
+                "date": today,
+                "step": "p1",
+                "p1": "",
+                "p2": "",
+                "p3": "",
+                "money": "",
+                "product": ""
+            }
+            await query.edit_message_text(
+                f"🗓️ Ежедневное планирование — {today}\n\n"
+                "Введите **Приоритет #1** (1 фраза).",
+                parse_mode="Markdown"
+            )
+            return
+        if data == "dailyplan_skip_p2":
+            chat_id = update.effective_chat.id
+            st = self.daily_plan_state.get(chat_id)
+            if not st:
+                await query.edit_message_text("Нет активного планирования. Запустите /plan")
+                return
+            st["p2"] = ""
+            st["step"] = "p3"
+            await query.edit_message_text(
+                "Введите **Приоритет #3** (или пропустите).",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏭️ Пропустить", callback_data="dailyplan_skip_p3")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="dailyplan_cancel")]
+                ])
+            )
+            return
+        if data == "dailyplan_skip_p3":
+            chat_id = update.effective_chat.id
+            st = self.daily_plan_state.get(chat_id)
+            if not st:
+                await query.edit_message_text("Нет активного планирования. Запустите /plan")
+                return
+            st["p3"] = ""
+            st["step"] = "money"
+            await query.edit_message_text(
+                "Введите **1 денежное действие** (что сделаете для денег сегодня).",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="dailyplan_cancel")]])
+            )
+            return
 
         # ----- Timezone setup -----
         if data.startswith('tz_set_'):
@@ -993,6 +1171,50 @@ class TaskAssistantBot:
             return
 
         # ----- Добавление задачи: выбор периодичности и дней -----
+        if data == 'addtask_skip_project':
+            chat_id = update.effective_chat.id
+            st = self.add_task_state.get(chat_id) or {}
+            st['project'] = ''
+            st['step'] = 'goal'
+            self.add_task_state[chat_id] = st
+            await query.edit_message_text(
+                "Ок. Укажите цель (опционально) или нажмите Пропустить.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏭️ Пропустить", callback_data="addtask_skip_goal")],
+                    [InlineKeyboardButton("Отмена", callback_data="addtask_cancel")]
+                ])
+            )
+            return
+        if data == 'addtask_skip_goal':
+            chat_id = update.effective_chat.id
+            st = self.add_task_state.get(chat_id) or {}
+            st['goal'] = ''
+            st['step'] = 'tags'
+            self.add_task_state[chat_id] = st
+            await query.edit_message_text(
+                "Ок. Укажите теги (через запятую, можно с #) или нажмите Пропустить.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏭️ Пропустить", callback_data="addtask_skip_tags")],
+                    [InlineKeyboardButton("Отмена", callback_data="addtask_cancel")]
+                ])
+            )
+            return
+        if data == 'addtask_skip_tags':
+            chat_id = update.effective_chat.id
+            st = self.add_task_state.get(chat_id) or {}
+            st['tags'] = []
+            st['step'] = 'frequency'
+            self.add_task_state[chat_id] = st
+            keyboard = [[
+                InlineKeyboardButton("Ежедневно", callback_data="addtask_freq_daily"),
+                InlineKeyboardButton("По дням недели", callback_data="addtask_freq_weekly")
+            ], [
+                InlineKeyboardButton("Одноразово", callback_data="addtask_freq_once")
+            ], [
+                InlineKeyboardButton("Отмена", callback_data="addtask_cancel")
+            ]]
+            await query.edit_message_text("Выберите периодичность:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
         if data.startswith('addtask_freq_'):
             freq = data.split('_')[2]
             chat_id = update.effective_chat.id
@@ -1054,6 +1276,15 @@ class TaskAssistantBot:
             if field == 'name':
                 st['awaiting'] = 'name'
                 await query.edit_message_text("Введите новое название задачи:")
+            elif field == 'project':
+                st['awaiting'] = 'project'
+                await query.edit_message_text("Введите проект/контекст (можно пусто):")
+            elif field == 'goal':
+                st['awaiting'] = 'goal'
+                await query.edit_message_text("Введите цель (можно пусто):")
+            elif field == 'tags':
+                st['awaiting'] = 'tags'
+                await query.edit_message_text("Введите теги через запятую (например: #sales, продукт, growth). Можно пусто.")
             elif field == 'freq':
                 keyboard = [[
                     InlineKeyboardButton("Ежедневно", callback_data="edittask_freq_daily"),
@@ -1129,6 +1360,9 @@ class TaskAssistantBot:
                 user_id,
                 def_id,
                 name=data_to_save.get('name'),
+                project=data_to_save.get('project'),
+                goal=data_to_save.get('goal'),
+                tags=data_to_save.get('tags'),
                 frequency=data_to_save.get('frequency'),
                 days=data_to_save.get('days'),
                 reminder_time=data_to_save.get('reminder_time'),
@@ -1179,6 +1413,24 @@ class TaskAssistantBot:
                 st_edit['data']['name'] = text[:64]
                 st_edit['awaiting'] = None
                 await self.send_message_to_chat(chat_id, "Название обновлено. Нажмите Сохранить или продолжите менять поля.", self.build_edit_menu_keyboard())
+                return
+            if awaiting_kind == 'project':
+                st_edit.setdefault('data', {})
+                st_edit['data']['project'] = text[:64] if text else ''
+                st_edit['awaiting'] = None
+                await self.send_message_to_chat(chat_id, "Проект обновлен. Нажмите Сохранить или продолжите менять поля.", self.build_edit_menu_keyboard())
+                return
+            if awaiting_kind == 'goal':
+                st_edit.setdefault('data', {})
+                st_edit['data']['goal'] = text[:96] if text else ''
+                st_edit['awaiting'] = None
+                await self.send_message_to_chat(chat_id, "Цель обновлена. Нажмите Сохранить или продолжите менять поля.", self.build_edit_menu_keyboard())
+                return
+            if awaiting_kind == 'tags':
+                st_edit.setdefault('data', {})
+                st_edit['data']['tags'] = self.db.parse_tags(text) if text else []
+                st_edit['awaiting'] = None
+                await self.send_message_to_chat(chat_id, "Теги обновлены. Нажмите Сохранить или продолжите менять поля.", self.build_edit_menu_keyboard())
                 return
             if awaiting_kind == 'reminder_time':
                 if not utils.validate_time_format(text):
@@ -1240,6 +1492,64 @@ class TaskAssistantBot:
                 context.user_data.pop('awaiting_comment_v2', None)
                 return
 
+        # 2.5) Ежедневное планирование (wizard)
+        st_plan = self.daily_plan_state.get(chat_id)
+        if st_plan:
+            step = st_plan.get("step")
+            if step == "p1":
+                if not text:
+                    await update.message.reply_text("Введите непустой текст для Приоритета #1.")
+                    return
+                st_plan["p1"] = text[:140]
+                st_plan["step"] = "p2"
+                await self.send_message_to_chat(
+                    chat_id,
+                    "Введите **Приоритет #2** (или пропустите).",
+                    InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⏭️ Пропустить", callback_data="dailyplan_skip_p2")],
+                        [InlineKeyboardButton("❌ Отмена", callback_data="dailyplan_cancel")]
+                    ]),
+                )
+                return
+            if step == "p2":
+                st_plan["p2"] = text[:140] if text else ""
+                st_plan["step"] = "p3"
+                await self.send_message_to_chat(
+                    chat_id,
+                    "Введите **Приоритет #3** (или пропустите).",
+                    InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⏭️ Пропустить", callback_data="dailyplan_skip_p3")],
+                        [InlineKeyboardButton("❌ Отмена", callback_data="dailyplan_cancel")]
+                    ]),
+                )
+                return
+            if step == "p3":
+                st_plan["p3"] = text[:140] if text else ""
+                st_plan["step"] = "money"
+                await self.send_message_to_chat(chat_id, "Введите **1 денежное действие** (что сделаете для денег сегодня).")
+                return
+            if step == "money":
+                if not text:
+                    await update.message.reply_text("Введите непустой текст для денежного действия.")
+                    return
+                st_plan["money"] = text[:200]
+                st_plan["step"] = "product"
+                await self.send_message_to_chat(chat_id, "Введите **1 действие по продукту** (что улучшите в продукте сегодня).")
+                return
+            if step == "product":
+                if not text:
+                    await update.message.reply_text("Введите непустой текст для действия по продукту.")
+                    return
+                st_plan["product"] = text[:200]
+                user_id = st_plan["user_id"]
+                date_str = st_plan["date"]
+                priorities = [st_plan.get("p1", ""), st_plan.get("p2", ""), st_plan.get("p3", "")]
+                self.db.upsert_daily_plan(user_id, date_str, priorities, st_plan.get("money", ""), st_plan.get("product", ""))
+                self.daily_plan_state.pop(chat_id, None)
+                plan = self.db.get_daily_plan(user_id, date_str)
+                await self.send_message_to_chat(chat_id, "✅ План сохранен!\n\n" + self._format_daily_plan_text(date_str, plan))
+                return
+
         # 3) Мастер добавления задач
         st = self.add_task_state.get(chat_id)
         if not st:
@@ -1249,6 +1559,34 @@ class TaskAssistantBot:
                 await update.message.reply_text("Введите непустое название")
                 return
             st['name'] = text[:64]
+            st['step'] = 'project'
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭️ Пропустить", callback_data="addtask_skip_project")],
+                [InlineKeyboardButton("Отмена", callback_data="addtask_cancel")]
+            ])
+            await update.message.reply_text("Укажите проект/контекст (опционально) или нажмите Пропустить:", reply_markup=kb)
+            return
+        if st.get('step') == 'project':
+            st['project'] = text[:64] if text else ''
+            st['step'] = 'goal'
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭️ Пропустить", callback_data="addtask_skip_goal")],
+                [InlineKeyboardButton("Отмена", callback_data="addtask_cancel")]
+            ])
+            await update.message.reply_text("Укажите цель (опционально) или нажмите Пропустить:", reply_markup=kb)
+            return
+        if st.get('step') == 'goal':
+            st['goal'] = text[:96] if text else ''
+            st['step'] = 'tags'
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭️ Пропустить", callback_data="addtask_skip_tags")],
+                [InlineKeyboardButton("Отмена", callback_data="addtask_cancel")]
+            ])
+            await update.message.reply_text("Укажите теги (через запятую, можно с #), или нажмите Пропустить:", reply_markup=kb)
+            return
+        if st.get('step') == 'tags':
+            # Теги опциональны
+            st['tags'] = self.db.parse_tags(text) if text else []
             st['step'] = 'frequency'
             keyboard = [[
                 InlineKeyboardButton("Ежедневно", callback_data="addtask_freq_daily"),
@@ -1299,7 +1637,18 @@ class TaskAssistantBot:
                 days = list(range(7))
             else:
                 days = []
-            def_id = self.db.add_task_definition(user_id, st['name'], frequency, days or list(range(7)), st['reminder_time'], st['check_time'], st.get('one_time_date'))
+            def_id = self.db.add_task_definition(
+                user_id,
+                st['name'],
+                frequency,
+                days or list(range(7)),
+                st['reminder_time'],
+                st['check_time'],
+                st.get('one_time_date'),
+                project=st.get('project'),
+                goal=st.get('goal'),
+                tags=st.get('tags')
+            )
             # Планируем
             saved_defs = self.db.list_task_definitions(user_id)
             target_def = next((d for d in saved_defs if d['id'] == def_id), None)
@@ -1436,6 +1785,9 @@ class TaskAssistantBot:
             'def_id': def_id,
             'data': {
                 'name': d.get('name'),
+                'project': d.get('project') or '',
+                'goal': d.get('goal') or '',
+                'tags': d.get('tags_list') or [],
                 'frequency': d.get('frequency'),
                 'days': d.get('days_list') or [],
                 'reminder_time': d.get('reminder_time'),
@@ -1483,6 +1835,14 @@ class TaskAssistantBot:
         lines = ["Ваши задачи (нажмите, чтобы управлять):"]
         days_names = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс']
         for d in defs:
+            ctx = []
+            if d.get('project'):
+                ctx.append(f"проект: {d.get('project')}")
+            if d.get('goal'):
+                ctx.append(f"цель: {d.get('goal')}")
+            tags_list = d.get('tags_list') or []
+            if tags_list:
+                ctx.append("теги: " + " ".join([f"#{t}" for t in tags_list]))
             freq_value = d.get('frequency')
             if freq_value == 'daily':
                 freq = 'Ежедневно'
@@ -1495,7 +1855,8 @@ class TaskAssistantBot:
             else:
                 freq = 'Одноразово'
                 freq_details = f"дата: {d.get('one_time_date') or '?'}"
-            lines.append(f"• #{d['id']} {d['name']} — {freq}, {freq_details}, напоминание {d['reminder_time']}, контроль {d['check_time']}")
+            ctx_str = (", " + "; ".join(ctx)) if ctx else ""
+            lines.append(f"• #{d['id']} {d['name']}{ctx_str} — {freq}, {freq_details}, напоминание {d['reminder_time']}, контроль {d['check_time']}")
         kb_rows = []
         for d in defs:
             kb_rows.append([InlineKeyboardButton(f"✏️ {d['name']} (#{d['id']})", callback_data=f"manage_def_{d['id']}")])
@@ -1582,6 +1943,9 @@ async def main():
         await application.bot.set_my_commands([
             BotCommand("start", "Запуск и регистрация"),
             BotCommand("help", "Помощь по командам"),
+            BotCommand("plan", "Ежедневное планирование"),
+            BotCommand("dailyplan", "Ежедневное планирование (алиас)"),
+            BotCommand("cancel", "Отменить текущий сценарий"),
             BotCommand("addtask", "Добавить задачу"),
             BotCommand("mytasks", "Мои задачи"),
             BotCommand("edittask", "Редактировать задачу"),
@@ -1618,6 +1982,9 @@ async def main():
     # Добавляем обработчики команд
     application.add_handler(CommandHandler("start", bot_instance.start))
     application.add_handler(CommandHandler("help", bot_instance.help_command))
+    application.add_handler(CommandHandler("plan", bot_instance.plan_command))
+    application.add_handler(CommandHandler("dailyplan", bot_instance.dailyplan_command))
+    application.add_handler(CommandHandler("cancel", bot_instance.cancel_command))
     application.add_handler(CommandHandler("today", bot_instance.today_command))
     application.add_handler(CommandHandler("stats", bot_instance.stats_command))
     application.add_handler(CommandHandler("report", bot_instance.report_command))

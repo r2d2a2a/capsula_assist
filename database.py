@@ -3,6 +3,8 @@ import datetime
 import logging
 from typing import List, Dict, Optional
 import pytz
+import json
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,9 @@ class TaskDatabase:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
+                project TEXT,            -- проект/контекст
+                goal TEXT,               -- цель
+                tags TEXT,               -- теги (строкой, нормализованные, через запятую)
                 frequency TEXT NOT NULL, -- 'daily' или 'weekly'
                 days TEXT,               -- список дней недели через запятую: "0,1,2,3,4,5,6"
                 reminder_time TEXT NOT NULL, -- HH:MM
@@ -57,6 +62,24 @@ class TaskDatabase:
                 FOREIGN KEY(user_id) REFERENCES users(id)
             )
         ''')
+        # Миграции: project/goal в task_definitions
+        cursor.execute("PRAGMA table_info(task_definitions)")
+        td_columns = [row[1] for row in cursor.fetchall()]
+        if 'project' not in td_columns:
+            try:
+                cursor.execute('ALTER TABLE task_definitions ADD COLUMN project TEXT')
+            except sqlite3.OperationalError:
+                pass
+        if 'goal' not in td_columns:
+            try:
+                cursor.execute('ALTER TABLE task_definitions ADD COLUMN goal TEXT')
+            except sqlite3.OperationalError:
+                pass
+        if 'tags' not in td_columns:
+            try:
+                cursor.execute('ALTER TABLE task_definitions ADD COLUMN tags TEXT')
+            except sqlite3.OperationalError:
+                pass
 
         # Таблица для хранения задач
         cursor.execute('''
@@ -141,6 +164,28 @@ class TaskDatabase:
         # Миграция: добавить one_time_date в task_definitions, если её нет
         try:
             cursor.execute('ALTER TABLE task_definitions ADD COLUMN one_time_date TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        # Таблица ежедневного планирования (сценарий)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS daily_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                date TEXT NOT NULL, -- YYYY-MM-DD в TZ пользователя
+                priorities_json TEXT, -- JSON массива из 3 строк
+                money_action TEXT,
+                product_action TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        ''')
+        try:
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_plans_user_date
+                ON daily_plans(user_id, date)
+            ''')
         except sqlite3.OperationalError:
             pass
         
@@ -316,15 +361,17 @@ class TaskDatabase:
         return (row[0] or 0)
 
     def add_task_definition(self, user_id: int, name: str, frequency: str, days: List[int], reminder_time: str, check_time: str,
-                            one_time_date: Optional[str] = None) -> int:
+                            one_time_date: Optional[str] = None, project: Optional[str] = None, goal: Optional[str] = None,
+                            tags: Optional[List[str]] = None) -> int:
         """Создать определение задачи. days — список [0..6]. Для одноразовых задач передавайте one_time_date."""
         days_str = ','.join(str(d) for d in sorted(set(days))) if days else ''
+        tags_str = ','.join(self.normalize_tags(tags or [])) if tags else None
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO task_definitions (user_id, name, frequency, days, reminder_time, check_time, one_time_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, name, frequency, days_str, reminder_time, check_time, one_time_date))
+            INSERT INTO task_definitions (user_id, name, project, goal, tags, frequency, days, reminder_time, check_time, one_time_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, name, (project or None), (goal or None), (tags_str or None), frequency, days_str, reminder_time, check_time, one_time_date))
         def_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -340,6 +387,8 @@ class TaskDatabase:
         for d in defs:
             days_str = d.get('days') or ''
             d['days_list'] = [int(x) for x in days_str.split(',') if x.strip().isdigit()]
+            tags_str = d.get('tags') or ''
+            d['tags_list'] = [t for t in self.normalize_tags([x.strip() for x in tags_str.split(',')]) if t]
         conn.close()
         return defs
 
@@ -355,18 +404,31 @@ class TaskDatabase:
         result = dict(zip(columns, row))
         days_str = result.get('days') or ''
         result['days_list'] = [int(x) for x in days_str.split(',') if x.strip().isdigit()]
+        tags_str = result.get('tags') or ''
+        result['tags_list'] = [t for t in self.normalize_tags([x.strip() for x in tags_str.split(',')]) if t]
         conn.close()
         return result
 
     def update_task_definition(self, user_id: int, def_id: int, name: Optional[str] = None, frequency: Optional[str] = None,
                                 days: Optional[List[int]] = None, reminder_time: Optional[str] = None, check_time: Optional[str] = None,
-                                one_time_date: Optional[str] = None) -> bool:
+                                one_time_date: Optional[str] = None, project: Optional[str] = None, goal: Optional[str] = None,
+                                tags: Optional[List[str]] = None) -> bool:
         """Обновить поля определения задачи. Возвращает True, если обновлено >=1 строк."""
         set_parts = []
         params: List = []
         if name is not None:
             set_parts.append('name = ?')
             params.append(name)
+        if project is not None:
+            set_parts.append('project = ?')
+            params.append(project or None)
+        if goal is not None:
+            set_parts.append('goal = ?')
+            params.append(goal or None)
+        if tags is not None:
+            tags_str = ','.join(self.normalize_tags(tags)) if tags else None
+            set_parts.append('tags = ?')
+            params.append(tags_str or None)
         if frequency is not None:
             set_parts.append('frequency = ?')
             params.append(frequency)
@@ -653,3 +715,107 @@ class TaskDatabase:
         
         conn.commit()
         conn.close()
+
+    # --------- Daily planning сценарий ---------
+
+    def upsert_daily_plan(self, user_id: int, date: str, priorities: List[str], money_action: str, product_action: str) -> None:
+        """Создать или обновить план дня для пользователя."""
+        clean_priorities = [(p or '').strip() for p in (priorities or [])][:3]
+        clean_priorities = [p for p in clean_priorities if p]
+        priorities_json = json.dumps(clean_priorities, ensure_ascii=False)
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO daily_plans (user_id, date, priorities_json, money_action, product_action, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id, date) DO UPDATE SET
+                    priorities_json=excluded.priorities_json,
+                    money_action=excluded.money_action,
+                    product_action=excluded.product_action,
+                    updated_at=CURRENT_TIMESTAMP
+            ''', (user_id, date, priorities_json, (money_action or '').strip(), (product_action or '').strip()))
+        except sqlite3.OperationalError:
+            # Фоллбек для очень старых SQLite без UPSERT
+            cursor.execute('SELECT id FROM daily_plans WHERE user_id = ? AND date = ?', (user_id, date))
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute('''
+                    UPDATE daily_plans
+                    SET priorities_json = ?, money_action = ?, product_action = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ? AND date = ?
+                ''', (priorities_json, (money_action or '').strip(), (product_action or '').strip(), user_id, date))
+            else:
+                cursor.execute('''
+                    INSERT INTO daily_plans (user_id, date, priorities_json, money_action, product_action, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ''', (user_id, date, priorities_json, (money_action or '').strip(), (product_action or '').strip()))
+        conn.commit()
+        conn.close()
+
+    def get_daily_plan(self, user_id: int, date: str) -> Optional[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM daily_plans WHERE user_id = ? AND date = ?', (user_id, date))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return None
+        columns = [d[0] for d in cursor.description]
+        result = dict(zip(columns, row))
+        try:
+            result['priorities'] = json.loads(result.get('priorities_json') or '[]')
+        except Exception:
+            result['priorities'] = []
+        conn.close()
+        return result
+
+    def get_daily_plans_for_period(self, user_id: int, start_date: str, end_date: str) -> List[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM daily_plans
+            WHERE user_id = ? AND date BETWEEN ? AND ?
+            ORDER BY date
+        ''', (user_id, start_date, end_date))
+        columns = [d[0] for d in cursor.description]
+        rows = [dict(zip(columns, r)) for r in cursor.fetchall()]
+        for r in rows:
+            try:
+                r['priorities'] = json.loads(r.get('priorities_json') or '[]')
+            except Exception:
+                r['priorities'] = []
+        conn.close()
+        return rows
+
+    # --------- Tags helpers ---------
+
+    def normalize_tags(self, tags: List[str]) -> List[str]:
+        """Нормализовать список тегов: lower, trim, без #, без пустых, уникальные, сохраняем порядок."""
+        result: List[str] = []
+        seen = set()
+        for t in tags or []:
+            raw = (t or "").strip()
+            if not raw:
+                continue
+            if raw.startswith("#"):
+                raw = raw[1:].strip()
+            raw = raw.lower()
+            raw = re.sub(r"\s+", " ", raw)
+            raw = re.sub(r"[^0-9a-zа-яё _-]", "", raw, flags=re.IGNORECASE)
+            raw = raw.strip()
+            if not raw:
+                continue
+            if raw in seen:
+                continue
+            seen.add(raw)
+            result.append(raw)
+        return result
+
+    def parse_tags(self, text: str) -> List[str]:
+        """Распарсить теги из строки пользователя: '#sales, product growth'."""
+        if not text:
+            return []
+        # Разделители: запятая, точка с запятой, перевод строки
+        parts = re.split(r"[,\n;]+", text)
+        return self.normalize_tags(parts)
