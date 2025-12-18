@@ -354,20 +354,33 @@ class TaskAssistantBot:
         )
 
     def _main_menu_keyboard(self) -> InlineKeyboardMarkup:
+        """Упрощенное главное меню с основными действиями"""
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 Сегодня", callback_data="menu_today"),
              InlineKeyboardButton("✅ Мои задачи", callback_data="menu_mytasks")],
             [InlineKeyboardButton("➕ Добавить задачу", callback_data="menu_addtask")],
-            [InlineKeyboardButton("🗓️ План дня", callback_data="menu_dailyplan"),
-             InlineKeyboardButton("📊 Отчет за сегодня", callback_data="menu_report")],
-            [InlineKeyboardButton("⚙️ Настройки (часовой пояс)", callback_data="menu_timezone")],
-            [InlineKeyboardButton("🧹 Сбросить текущий ввод", callback_data="menu_cancel"),
-             InlineKeyboardButton("❓ Помощь", callback_data="menu_help")]
+            [InlineKeyboardButton("🗓️ План дня", callback_data="menu_dailyplan")],
+            [InlineKeyboardButton("⚙️ Еще", callback_data="menu_more")]
+        ])
+    
+    def _more_menu_keyboard(self) -> InlineKeyboardMarkup:
+        """Подменю с дополнительными функциями"""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Отчет за сегодня", callback_data="menu_report")],
+            [InlineKeyboardButton("🌍 Часовой пояс", callback_data="menu_timezone")],
+            [InlineKeyboardButton("❓ Помощь", callback_data="menu_help")],
+            [InlineKeyboardButton("↩️ Отмена", callback_data="menu_cancel")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_home")]
         ])
 
     async def menu_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /menu — главный экран с инлайн-меню."""
-        await update.message.reply_text("Главное меню:", reply_markup=self._main_menu_keyboard())
+        # Поддержка вызова как из обычного сообщения, так и из callback query
+        if update.message:
+            await update.message.reply_text("Главное меню:", reply_markup=self._main_menu_keyboard())
+        else:
+            chat_id = update.effective_chat.id
+            await self.send_message_to_chat(chat_id, "Главное меню:", self._main_menu_keyboard())
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /help"""
@@ -388,7 +401,12 @@ class TaskAssistantBot:
             "/report — отчет за сегодня\n"
             "/timezone — часовой пояс\n"
         )
-        await update.message.reply_text(help_text)
+        # Поддержка вызова как из обычного сообщения, так и из callback query
+        if update.message:
+            await update.message.reply_text(help_text)
+        else:
+            chat_id = update.effective_chat.id
+            await self.send_message_to_chat(chat_id, help_text)
 
     def _format_daily_plan_text(self, date_str: str, plan: Optional[Dict]) -> str:
         if not plan:
@@ -434,7 +452,7 @@ class TaskAssistantBot:
         chat_id = update.effective_chat.id
         user = self.db.get_user_by_chat_id(chat_id)
         if not user:
-            await update.message.reply_text("Начните с /start")
+            await self.send_message_to_chat(chat_id, "Начните с /start")
             return
         user_id = user['id']
         tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
@@ -465,11 +483,19 @@ class TaskAssistantBot:
             context.user_data.pop('awaiting_comment_v2', None)
         except Exception:
             pass
-        await update.message.reply_text(
-            "🧹 Готово — я сбросил текущий ввод.\n"
-            "Открой /menu, чтобы продолжить.",
-            reply_markup=self._main_menu_keyboard()
+        message_text = (
+            "✅ Готово! Отменил незавершенные действия "
+            "(добавление задачи, план дня, настройки).\n\n"
+            "Что делаем дальше?"
         )
+        # Поддержка вызова как из обычного сообщения, так и из callback query
+        if update.message:
+            await update.message.reply_text(
+                message_text,
+                reply_markup=self._main_menu_keyboard()
+            )
+        else:
+            await self.send_message_to_chat(chat_id, message_text, self._main_menu_keyboard())
 
     async def timezone_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /timezone — установка TZ пользователя."""
@@ -491,14 +517,21 @@ class TaskAssistantBot:
             [InlineKeyboardButton("Ввести вручную", callback_data="tz_manual")],
         ]
         context.user_data['awaiting_timezone'] = True
-        await update.message.reply_text(
+        message_text = (
             f"Текущий часовой пояс: {self._format_timezone(tz_str)}\n\n"
             "Выберите вариант кнопкой или отправьте сообщением, например:\n"
             "- Europe/Paris\n"
             "- America/Los_Angeles\n"
-            "- UTC+03:00 или +3\n",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "- UTC+03:00 или +3\n"
         )
+        # Поддержка вызова как из обычного сообщения, так и из callback query
+        if update.message:
+            await update.message.reply_text(
+                message_text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await self.send_message_to_chat(chat_id, message_text, InlineKeyboardMarkup(keyboard))
     
     async def send_task_reminder(self, task_type: str, task_name: str):
         """Отправить напоминание о задаче"""
@@ -914,7 +947,14 @@ class TaskAssistantBot:
                     context.user_data.pop('awaiting_comment_v2', None)
                 except Exception:
                     pass
-                await query.edit_message_text("🧹 Сбросил текущий ввод. Что делаем дальше?", reply_markup=self._main_menu_keyboard())
+                await query.edit_message_text(
+                    "✅ Готово! Отменил незавершенные действия (добавление задачи, план дня, настройки).\n\n"
+                    "Что делаем дальше?",
+                    reply_markup=self._main_menu_keyboard()
+                )
+                return
+            if data == "menu_more":
+                await query.edit_message_text("⚙️ Дополнительные функции:", reply_markup=self._more_menu_keyboard())
                 return
             if data == "menu_home":
                 await query.edit_message_text("Главное меню:", reply_markup=self._main_menu_keyboard())
@@ -1829,7 +1869,7 @@ class TaskAssistantBot:
         chat_id = update.effective_chat.id
         user = self.db.get_user_by_chat_id(chat_id)
         if not user:
-            await update.message.reply_text("Начните с /start")
+            await self.send_message_to_chat(chat_id, "Начните с /start")
             return
         # Пытаемся отправить полноценный отчет. Если что-то пойдет не так, даем простой ответ, чтобы команда не молчала.
         try:
@@ -1846,10 +1886,10 @@ class TaskAssistantBot:
                     f"• Выполнено: {stats['completed_tasks']}\n"
                     f"• Процент выполнения: {stats['completion_rate']}%"
                 )
-                await update.message.reply_text(msg)
+                await self.send_message_to_chat(chat_id, msg)
             except Exception as inner_e:
                 logger.error(f"/report: ошибка резервного ответа: {inner_e}")
-                await update.message.reply_text("Не удалось сформировать отчет. Попробуйте позже.")
+                await self.send_message_to_chat(chat_id, "Не удалось сформировать отчет. Попробуйте позже.")
 
     async def addtask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
