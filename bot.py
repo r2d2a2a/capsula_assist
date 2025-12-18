@@ -342,48 +342,52 @@ class TaskAssistantBot:
         user_id = self.db.upsert_user(chat_id, username)
         tz_str = self.db.get_user_timezone(user_id)
         self.schedule_all_for_user(chat_id, user_id)
-        
-        welcome_text = """
-🤖 Добро пожаловать в ваш персональный ассистент задач!
 
-Добавьте свои задачи и получайте напоминания и контроль выполнения.
-
-📊 Отчеты:
-• Ежедневный отчет в 20:00
-• Еженедельный отчет в воскресенье в 20:30
-
-Используйте /help для получения списка команд.
-        """
-        await update.message.reply_text(welcome_text)
-        await update.message.reply_text(
-            f"Ваш часовой пояс сейчас: {self._format_timezone(tz_str)}\n"
-            "Если вы не в МСК — задайте свой часовой пояс командой /timezone.\n\n"
-            "Добавьте свою задачу командой /addtask. Посмотреть список: /mytasks"
+        welcome_text = (
+            "👋 Привет! Я помогу тебе с задачами и ежедневным планом.\n\n"
+            "Нажми кнопку ниже, чтобы начать."
         )
+        await update.message.reply_text(welcome_text, reply_markup=self._main_menu_keyboard())
+        await update.message.reply_text(
+            f"🕒 Твой часовой пояс: {self._format_timezone(tz_str)}\n"
+            "Если нужно — поменяй в настройках."
+        )
+
+    def _main_menu_keyboard(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Сегодня", callback_data="menu_today"),
+             InlineKeyboardButton("✅ Мои задачи", callback_data="menu_mytasks")],
+            [InlineKeyboardButton("➕ Добавить задачу", callback_data="menu_addtask")],
+            [InlineKeyboardButton("🗓️ План дня", callback_data="menu_dailyplan"),
+             InlineKeyboardButton("📊 Отчет за сегодня", callback_data="menu_report")],
+            [InlineKeyboardButton("⚙️ Настройки (часовой пояс)", callback_data="menu_timezone")],
+            [InlineKeyboardButton("🧹 Сбросить текущий ввод", callback_data="menu_cancel"),
+             InlineKeyboardButton("❓ Помощь", callback_data="menu_help")]
+        ])
+
+    async def menu_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /menu — главный экран с инлайн-меню."""
+        await update.message.reply_text("Главное меню:", reply_markup=self._main_menu_keyboard())
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /help"""
-        help_text = """
-📖 Доступные команды:
-
-/start - Начать работу с ботом
-/help - Показать это сообщение
-/plan - Ежедневное планирование (3 приоритета/деньги/продукт)
-/dailyplan - То же самое, алиас
-/addtask - Добавить задачу (до 10)
-/cancel - Отменить добавление задачи
-/mytasks - Список моих задач
-/today - Показать задачи на сегодня
-/stats - Показать статистику за сегодня
-/report - Получить отчет за сегодня
- /timezone - Установить часовой пояс
- /edittask - Редактировать задачу (список с кнопками)
- /deletetask - Удалить задачу (список с кнопками)
- 
-🔧 Управление:
-/start_bot - Запустить напоминания
-/stop_bot - Остановить напоминания
-        """
+        help_text = (
+            "❓ Помощь\n\n"
+            "Самый простой способ — открыть /menu и пользоваться кнопками.\n\n"
+            "Что есть что:\n"
+            "- 🗓️ Ежедневное планирование (/plan): запись на сегодня (3 приоритета + деньги + продукт).\n"
+            "- ✅ Задачи (/addtask): напоминания по расписанию (ежедневно/по дням/одноразово).\n"
+            "- 🧹 Сбросить текущий ввод (/cancel): отменяет незавершённые сценарии ввода "
+            "(добавление/редактирование задачи, план дня, ввод часового пояса, ввод комментария).\n\n"
+            "Команды (если удобнее руками):\n"
+            "/menu — главное меню\n"
+            "/today — задачи на сегодня\n"
+            "/mytasks — список задач\n"
+            "/addtask — добавить задачу\n"
+            "/plan — план дня\n"
+            "/report — отчет за сегодня\n"
+            "/timezone — часовой пояс\n"
+        )
         await update.message.reply_text(help_text)
 
     def _format_daily_plan_text(self, date_str: str, plan: Optional[Dict]) -> str:
@@ -403,6 +407,28 @@ class TaskAssistantBot:
         lines.append(f"🧩 Действие по продукту: {plan.get('product_action') or '—'}")
         return "\n".join(lines)
 
+    def _dailyplan_help_text(self) -> str:
+        return (
+            "🗓️ **Ежедневное планирование** — это короткая настройка фокуса на день.\n\n"
+            "Зачем:\n"
+            "- 🎯 выбрать 1–3 главных результата на сегодня (чтобы не распыляться)\n"
+            "- 💰 запланировать одно действие, которое двигает деньги\n"
+            "- 🧩 запланировать одно действие, которое двигает продукт/проект\n\n"
+            "Как работает:\n"
+            "- я задам 5 коротких вопросов (3 приоритета + деньги + продукт)\n"
+            "- ответы сохраняются **только на сегодня**\n"
+            "- в ежедневном отчёте план появится отдельным блоком\n"
+        )
+
+    def _dailyplan_menu_keyboard(self, has_plan: bool) -> InlineKeyboardMarkup:
+        primary_label = "✍️ Заполнить/обновить" if has_plan else "✍️ Заполнить план"
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(primary_label, callback_data="dailyplan_start")],
+            [InlineKeyboardButton("❓ Что это такое?", callback_data="dailyplan_info")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="menu_home"),
+             InlineKeyboardButton("Закрыть", callback_data="dailyplan_close")]
+        ])
+
     async def dailyplan_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Сценарий: Ежедневное планирование (3 приоритета, 1 денежное действие, 1 действие по продукту)."""
         chat_id = update.effective_chat.id
@@ -414,12 +440,14 @@ class TaskAssistantBot:
         tz = self._tzinfo_from_string(self.db.get_user_timezone(user_id))
         today = datetime.datetime.now(tz).strftime('%Y-%m-%d')
         plan = self.db.get_daily_plan(user_id, today)
-        text = self._format_daily_plan_text(today, plan)
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✍️ Заполнить/обновить", callback_data="dailyplan_start")],
-            [InlineKeyboardButton("Закрыть", callback_data="dailyplan_close")]
-        ])
-        await self.send_message_to_chat(chat_id, text, kb)
+        has_plan = bool(plan)
+        header = (
+            f"🗓️ План дня на сегодня — {today}\n\n"
+            "Это быстрый способ зафиксировать фокус: **приоритеты + деньги + продукт**.\n"
+            "Нажмите «Заполнить», отвечайте короткими фразами.\n\n"
+        )
+        text = header + self._format_daily_plan_text(today, plan)
+        await self.send_message_to_chat(chat_id, text, self._dailyplan_menu_keyboard(has_plan))
 
     async def plan_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Алиас для /dailyplan."""
@@ -437,7 +465,11 @@ class TaskAssistantBot:
             context.user_data.pop('awaiting_comment_v2', None)
         except Exception:
             pass
-        await update.message.reply_text("❌ Отменено.")
+        await update.message.reply_text(
+            "🧹 Готово — я сбросил текущий ввод.\n"
+            "Открой /menu, чтобы продолжить.",
+            reply_markup=self._main_menu_keyboard()
+        )
 
     async def timezone_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /timezone — установка TZ пользователя."""
@@ -845,14 +877,66 @@ class TaskAssistantBot:
         
         data = query.data
 
+        # ----- Main menu -----
+        if data.startswith("menu_"):
+            # Важно: многие команды пишут в чат новым сообщением, чтобы не ломать контекст.
+            if data == "menu_help":
+                await self.help_command(update, context)
+                return
+            if data == "menu_today":
+                await self.today_command(update, context)
+                return
+            if data == "menu_mytasks":
+                await self.mytasks_command(update, context)
+                return
+            if data == "menu_addtask":
+                class _Ctx:
+                    args = []
+                await self.addtask_command(update, _Ctx())
+                return
+            if data == "menu_dailyplan":
+                await self.dailyplan_command(update, context)
+                return
+            if data == "menu_report":
+                await self.report_command(update, context)
+                return
+            if data == "menu_timezone":
+                await self.timezone_command(update, context)
+                return
+            if data == "menu_cancel":
+                chat_id = update.effective_chat.id
+                self.add_task_state.pop(chat_id, None)
+                self.edit_task_state.pop(chat_id, None)
+                self.daily_plan_state.pop(chat_id, None)
+                try:
+                    context.user_data.pop('awaiting_timezone', None)
+                    context.user_data.pop('awaiting_comment', None)
+                    context.user_data.pop('awaiting_comment_v2', None)
+                except Exception:
+                    pass
+                await query.edit_message_text("🧹 Сбросил текущий ввод. Что делаем дальше?", reply_markup=self._main_menu_keyboard())
+                return
+            if data == "menu_home":
+                await query.edit_message_text("Главное меню:", reply_markup=self._main_menu_keyboard())
+                return
+
         # ----- Daily planning -----
         if data == "dailyplan_close":
             await query.edit_message_text("Ок.")
             return
+        if data == "dailyplan_info":
+            await query.edit_message_text(self._dailyplan_help_text(), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✍️ Заполнить/обновить", callback_data="dailyplan_start")],
+                [InlineKeyboardButton("🏠 В меню", callback_data="menu_home")]
+            ]))
+            return
         if data == "dailyplan_cancel":
             chat_id = update.effective_chat.id
             self.daily_plan_state.pop(chat_id, None)
-            await query.edit_message_text("❌ Ежедневное планирование отменено.")
+            await query.edit_message_text(
+                "🧹 Ок, я отменил заполнение плана.\n\nЧто дальше?",
+                reply_markup=self._main_menu_keyboard()
+            )
             return
         if data == "dailyplan_start":
             chat_id = update.effective_chat.id
@@ -874,8 +958,10 @@ class TaskAssistantBot:
                 "product": ""
             }
             await query.edit_message_text(
-                f"🗓️ Ежедневное планирование — {today}\n\n"
-                "Введите **Приоритет #1** (1 фраза).",
+                f"🗓️ План дня — {today}\n\n"
+                "Я задам 5 вопросов. Отвечай коротко, 1 фразой.\n\n"
+                "**Шаг 1/5** — Приоритет #1\n"
+                "Что самое важное сделать сегодня?",
                 parse_mode="Markdown"
             )
             return
@@ -888,7 +974,8 @@ class TaskAssistantBot:
             st["p2"] = ""
             st["step"] = "p3"
             await query.edit_message_text(
-                "Введите **Приоритет #3** (или пропустите).",
+                "**Шаг 3/5** — Приоритет #3\n"
+                "Если нужно — добавь ещё один приоритет. Если нет — пропусти.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⏭️ Пропустить", callback_data="dailyplan_skip_p3")],
@@ -905,7 +992,8 @@ class TaskAssistantBot:
             st["p3"] = ""
             st["step"] = "money"
             await query.edit_message_text(
-                "Введите **1 денежное действие** (что сделаете для денег сегодня).",
+                "**Шаг 4/5** — Денежное действие\n"
+                "Одно действие, которое реально двигает деньги сегодня (звонок/оффер/продажа/счет и т.п.).",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="dailyplan_cancel")]])
             )
@@ -1504,7 +1592,8 @@ class TaskAssistantBot:
                 st_plan["step"] = "p2"
                 await self.send_message_to_chat(
                     chat_id,
-                    "Введите **Приоритет #2** (или пропустите).",
+                    "**Шаг 2/5** — Приоритет #2\n"
+                    "Если нужно — добавь ещё один приоритет. Если нет — пропусти.",
                     InlineKeyboardMarkup([
                         [InlineKeyboardButton("⏭️ Пропустить", callback_data="dailyplan_skip_p2")],
                         [InlineKeyboardButton("❌ Отмена", callback_data="dailyplan_cancel")]
@@ -1516,7 +1605,8 @@ class TaskAssistantBot:
                 st_plan["step"] = "p3"
                 await self.send_message_to_chat(
                     chat_id,
-                    "Введите **Приоритет #3** (или пропустите).",
+                    "**Шаг 3/5** — Приоритет #3\n"
+                    "Если нужно — добавь ещё один приоритет. Если нет — пропусти.",
                     InlineKeyboardMarkup([
                         [InlineKeyboardButton("⏭️ Пропустить", callback_data="dailyplan_skip_p3")],
                         [InlineKeyboardButton("❌ Отмена", callback_data="dailyplan_cancel")]
@@ -1526,7 +1616,12 @@ class TaskAssistantBot:
             if step == "p3":
                 st_plan["p3"] = text[:140] if text else ""
                 st_plan["step"] = "money"
-                await self.send_message_to_chat(chat_id, "Введите **1 денежное действие** (что сделаете для денег сегодня).")
+                await self.send_message_to_chat(
+                    chat_id,
+                    "**Шаг 4/5** — Денежное действие\n"
+                    "Одно действие, которое двигает деньги сегодня.",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="dailyplan_cancel")]])
+                )
                 return
             if step == "money":
                 if not text:
@@ -1534,7 +1629,12 @@ class TaskAssistantBot:
                     return
                 st_plan["money"] = text[:200]
                 st_plan["step"] = "product"
-                await self.send_message_to_chat(chat_id, "Введите **1 действие по продукту** (что улучшите в продукте сегодня).")
+                await self.send_message_to_chat(
+                    chat_id,
+                    "**Шаг 5/5** — Действие по продукту\n"
+                    "Одно действие, которое двигает продукт/проект сегодня.",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="dailyplan_cancel")]])
+                )
                 return
             if step == "product":
                 if not text:
@@ -1547,7 +1647,11 @@ class TaskAssistantBot:
                 self.db.upsert_daily_plan(user_id, date_str, priorities, st_plan.get("money", ""), st_plan.get("product", ""))
                 self.daily_plan_state.pop(chat_id, None)
                 plan = self.db.get_daily_plan(user_id, date_str)
-                await self.send_message_to_chat(chat_id, "✅ План сохранен!\n\n" + self._format_daily_plan_text(date_str, plan))
+                await self.send_message_to_chat(
+                    chat_id,
+                    "✅ План сохранен!\n\n" + self._format_daily_plan_text(date_str, plan),
+                    reply_markup=self._main_menu_keyboard()
+                )
                 return
 
         # 3) Мастер добавления задач
@@ -1942,15 +2046,11 @@ async def main():
     try:
         await application.bot.set_my_commands([
             BotCommand("start", "Запуск и регистрация"),
-            BotCommand("help", "Помощь по командам"),
-            BotCommand("plan", "Ежедневное планирование"),
-            BotCommand("dailyplan", "Ежедневное планирование (алиас)"),
-            BotCommand("cancel", "Отменить текущий сценарий"),
+            BotCommand("menu", "Главное меню (кнопки)"),
+            BotCommand("help", "Что где находится"),
+            BotCommand("today", "Задачи на сегодня"),
             BotCommand("addtask", "Добавить задачу"),
-            BotCommand("mytasks", "Мои задачи"),
-            BotCommand("edittask", "Редактировать задачу"),
-            BotCommand("deletetask", "Удалить задачу"),
-            BotCommand("report", "Отчет за сегодня"),
+            BotCommand("cancel", "Сбросить текущий ввод"),
             BotCommand("timezone", "Часовой пояс"),
         ])
     except Exception as e:
@@ -1981,6 +2081,7 @@ async def main():
     
     # Добавляем обработчики команд
     application.add_handler(CommandHandler("start", bot_instance.start))
+    application.add_handler(CommandHandler("menu", bot_instance.menu_command))
     application.add_handler(CommandHandler("help", bot_instance.help_command))
     application.add_handler(CommandHandler("plan", bot_instance.plan_command))
     application.add_handler(CommandHandler("dailyplan", bot_instance.dailyplan_command))
